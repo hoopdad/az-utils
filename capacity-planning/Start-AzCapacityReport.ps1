@@ -468,3 +468,50 @@ if ($subscriptions.Count -gt 1) {
     Write-Host "Summary: $($r.SummaryPath)"
     Write-Host "`nScripts: $($r.SuccessCount) succeeded, $($r.FailCount) failed" -ForegroundColor $(if ($r.FailCount -gt 0) { 'Yellow' } else { 'Green' })
 }
+
+# Generate Excel report
+$excelScript = Join-Path $scriptDir 'convert_to_excel.py'
+$excelOutput = Join-Path $rootReportDir 'capacity-report.xlsx'
+
+if (Test-Path $excelScript) {
+    Write-Host "`nGenerating Excel report..." -ForegroundColor Cyan
+
+    # Find Python
+    $pythonCmd = $null
+    foreach ($candidate in @('python3', 'python', 'py')) {
+        try {
+            $ver = & $candidate --version 2>&1
+            if ($LASTEXITCODE -eq 0) { $pythonCmd = $candidate; break }
+        } catch { }
+    }
+
+    if ($pythonCmd) {
+        try {
+            # Check openpyxl is available
+            $checkImport = & $pythonCmd -c "import openpyxl" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  Installing openpyxl..." -ForegroundColor Yellow
+                & $pythonCmd -m pip install openpyxl --quiet --break-system-packages 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    & $pythonCmd -m pip install openpyxl --quiet 2>$null
+                }
+            }
+
+            & $pythonCmd $excelScript $rootReportDir $excelOutput
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $excelOutput)) {
+                $excelSize = [math]::Round((Get-Item $excelOutput).Length / 1KB, 1)
+                Write-Host "  ✅ Excel report: $excelOutput ($excelSize KB)" -ForegroundColor Green
+            } else {
+                Write-Host "  ⚠️  Excel generation failed" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "  ⚠️  Excel generation failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  ⚠️  Python not found - skipping Excel generation" -ForegroundColor Yellow
+        Write-Host "     Install Python and openpyxl, then run manually:" -ForegroundColor Gray
+        Write-Host "     python3 $excelScript $rootReportDir" -ForegroundColor Gray
+    }
+} else {
+    Write-Host "`n⚠️  convert_to_excel.py not found - skipping Excel generation" -ForegroundColor Yellow
+}
