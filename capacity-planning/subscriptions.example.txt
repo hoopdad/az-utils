@@ -2,4 +2,5 @@
 # Format: SubscriptionId or SubscriptionId,DisplayName
 # Lines starting with # are ignored, blank lines are ignored
 
-00000000-0000-0000-0000-000000000000,sample-bootstrap-sub
+aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,my-first-subscription
+ffffffff-1111-2222-3333-444444444444,my-second-subscription
