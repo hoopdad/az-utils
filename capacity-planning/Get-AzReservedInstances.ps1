@@ -63,6 +63,33 @@ function ConvertFrom-AzJsonText {
     throw "Unable to parse Azure CLI output as JSON."
 }
 
+function Test-IsAuthorizationError {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    $patterns = @(
+        'AuthorizationFailed',
+        'does not have authorization',
+        'Insufficient privileges',
+        'insufficient permissions',
+        'status code 403',
+        'Forbidden',
+        'Microsoft\.Capacity/reservationOrders/read',
+        'Reservations Reader'
+    )
+
+    foreach ($pattern in $patterns) {
+        if ($Text -match $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Invoke-AzJson {
     param(
         [string[]]$Arguments,
@@ -80,24 +107,27 @@ function Invoke-AzJson {
         }
 
         return [pscustomobject]@{
-            Success = $false
-            Error   = $errorMessage
-            Raw     = $text
+            Success              = $false
+            Error                = $errorMessage
+            Raw                  = $text
+            IsAuthorizationError = Test-IsAuthorizationError -Text $text
         }
     }
 
     try {
         return [pscustomobject]@{
-            Success = $true
-            Data    = ConvertFrom-AzJsonText -Text $text
-            Raw     = $text
+            Success              = $true
+            Data                 = ConvertFrom-AzJsonText -Text $text
+            Raw                  = $text
+            IsAuthorizationError = $false
         }
     }
     catch {
         return [pscustomobject]@{
-            Success = $false
-            Error   = "Failed to parse JSON for $Context. $($_.Exception.Message)"
-            Raw     = $text
+            Success              = $false
+            Error                = "Failed to parse JSON for $Context. $($_.Exception.Message)"
+            Raw                  = $text
+            IsAuthorizationError = $false
         }
     }
 }
@@ -335,6 +365,11 @@ $now = (Get-Date).ToUniversalTime()
 $permissionNotes = 'No access to reservation data'
 $coverageSource = 'Azure CLI'
 $hasReservationListFailures = $false
+$requiredRole = 'Reservations Reader role at the tenant or billing scope'
+$permissionFailureReason = 'Insufficient permissions. Requires Reservations Reader role.'
+$scriptStatus = 'success'
+$scriptReason = $null
+$permissionStatus = 'fullAccess'
 
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     $errors.Add('Azure CLI (az) is not installed or not available on PATH.')
@@ -367,17 +402,18 @@ if ($accountResult -and $accountResult.Success) {
 
 $reservationOrders = @()
 $orderCollectionSucceeded = $false
+$orderPermissionFailure = $false
 
 if ($errors.Count -eq 0) {
-    $orderResult = Invoke-AzJson -Arguments @('reservations', 'reservation-order', 'list', '--subscription', $resolvedSubscriptionId, '--only-show-errors', '--output', 'json') -Context 'reservation-order list'
+    $primaryOrderResult = Invoke-AzJson -Arguments @('reservations', 'reservation-order', 'list', '--subscription', $resolvedSubscriptionId, '--only-show-errors', '--output', 'json') -Context 'reservation-order list'
 
-    if ($orderResult.Success) {
-        $reservationOrders = ConvertTo-Array $orderResult.Data
+    if ($primaryOrderResult.Success) {
+        $reservationOrders = ConvertTo-Array $primaryOrderResult.Data
         $orderCollectionSucceeded = $true
     }
     else {
-        $warnings.Add("Azure CLI reservation-order list failed. Attempting REST fallback. $($orderResult.Error)")
-        $orderResult = Invoke-AzJson -Arguments @(
+        $warnings.Add("Azure CLI reservation-order list failed. Attempting REST fallback. $($primaryOrderResult.Error)")
+        $fallbackOrderResult = Invoke-AzJson -Arguments @(
             'rest', '--method', 'GET',
             '--url', 'https://management.azure.com/providers/Microsoft.Capacity/reservationOrders?api-version=2022-11-01',
             '--subscription', $resolvedSubscriptionId,
@@ -385,13 +421,25 @@ if ($errors.Count -eq 0) {
             '--output', 'json'
         ) -Context 'reservation-order REST list'
 
-        if ($orderResult.Success) {
+        if ($fallbackOrderResult.Success) {
             $coverageSource = 'REST fallback'
-            $reservationOrders = ConvertTo-Array $orderResult.Data.value
+            $reservationOrders = ConvertTo-Array $fallbackOrderResult.Data.value
             $orderCollectionSucceeded = $true
         }
         else {
-            $errors.Add("Unable to enumerate reservation orders. $($orderResult.Error)")
+            if ($primaryOrderResult.IsAuthorizationError -or $fallbackOrderResult.IsAuthorizationError) {
+                $orderPermissionFailure = $true
+                $scriptStatus = 'skipped'
+                $scriptReason = $permissionFailureReason
+                $permissionStatus = 'insufficientPermissions'
+                $permissionNotes = 'Reservation data skipped due to missing Reservations Reader access.'
+                $warnings.Add("Reservation access requires $requiredRole.")
+                $warnings.Add($primaryOrderResult.Error)
+                $warnings.Add($fallbackOrderResult.Error)
+            }
+            else {
+                $errors.Add("Unable to enumerate reservation orders. $($fallbackOrderResult.Error)")
+            }
         }
     }
 }
@@ -446,7 +494,11 @@ foreach ($record in $records) {
     }
 }
 
-$coverageNotes = switch ($permissionNotes) {
+if ($orderPermissionFailure) {
+    $coverageNotes = 'Reservation queries were skipped because the current identity does not have Microsoft.Capacity/reservationOrders/read.'
+}
+else {
+    $coverageNotes = switch ($permissionNotes) {
     'Full access to reservation data' {
         if ($records.Count -eq 0) {
             'Reservation queries succeeded, but no reservations were returned for the current context.'
@@ -461,6 +513,7 @@ $coverageNotes = switch ($permissionNotes) {
     default {
         'Reservation data could not be collected. Output is intentionally fail-soft so downstream tooling can still consume the file.'
     }
+    }
 }
 
 if ($records.Count -eq 0 -and $permissionNotes -eq 'Full access to reservation data') {
@@ -472,14 +525,20 @@ $warningArray = $warnings.ToArray()
 $recordArray = $records.ToArray()
 
 $envelope = [ordered]@{
+    status = $scriptStatus
+    reason = $scriptReason
     metadata = [ordered]@{
-        scriptName       = 'Get-AzReservedInstances'
-        subscriptionId   = $resolvedSubscriptionId
-        subscriptionName = $resolvedSubscriptionName
-        collectedAt      = (Get-Date).ToUniversalTime().ToString('o')
-        errors           = $errorArray
-        warnings         = $warningArray
-        permissionNotes  = $permissionNotes
+        scriptName          = 'Get-AzReservedInstances'
+        subscriptionId      = $resolvedSubscriptionId
+        subscriptionName    = $resolvedSubscriptionName
+        collectedAt         = (Get-Date).ToUniversalTime().ToString('o')
+        errors              = $errorArray
+        warnings            = $warningArray
+        permissionStatus    = $permissionStatus
+        permissionNotes     = $permissionNotes
+        minimumRole         = 'Reader'
+        requiredRole        = $requiredRole
+        additionalPermission = 'Microsoft.Capacity/reservationOrders/read'
     }
     summary = [ordered]@{
         totalReservations    = $recordArray.Count
@@ -496,6 +555,12 @@ $outputFile = Join-Path -Path $OutputPath -ChildPath 'reserved-instances.json'
 $envelope | ConvertTo-Json -Depth 20 | Set-Content -Path $outputFile -Encoding UTF8
 
 Write-Host "Reserved Instances output: $outputFile"
+if ($scriptStatus -eq 'skipped') {
+    Write-Host $scriptReason -ForegroundColor Yellow
+    Write-Host "Required role: $requiredRole" -ForegroundColor Yellow
+    exit 0
+}
+
 Write-Host "Total reservations: $($records.Count)"
 $typeSummaryText = 'None'
 if ($typeSummary.Count -gt 0) {

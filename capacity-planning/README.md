@@ -15,6 +15,9 @@ pwsh Start-AzCapacityReport.ps1 -SubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxx
 # Multiple subscriptions from a file
 pwsh Start-AzCapacityReport.ps1 -SubscriptionFile subscriptions.txt -OutputPath ./reports
 
+# Skip scripts that need elevated reservation permissions
+pwsh Start-AzCapacityReport.ps1 -OutputPath ./reports -SkipElevated
+
 # Or run individual scripts
 pwsh Get-AzServiceInventory.ps1 -OutputPath ./reports
 pwsh Get-AzQuotaUsage.ps1 -OutputPath ./reports
@@ -26,7 +29,23 @@ The orchestrator creates a timestamped directory (e.g., `reports/capacity-report
 
 - **PowerShell 7+** (`pwsh`)
 - **Azure CLI** (`az`) — logged in with `az login`
-- **Permissions**: Reader role on the target subscription. Reservation data requires billing-scope permissions (the script handles missing permissions gracefully).
+- **Minimum subscription access**: **Reader** on every target subscription
+- **Optional elevated access** for reservations: **Reservations Reader** at the tenant or billing scope
+
+## Required Permissions
+
+All scripts assume the current identity can read subscription metadata. The four **core scripts** only require the built-in **Reader** role on each subscription. The **Reserved Instances** script needs one extra permission beyond Reader: `Microsoft.Capacity/reservationOrders/read`, which is provided by the built-in **Reservations Reader** role.
+
+| Script | Azure CLI operations | Minimum role(s) | Reader sufficient? | Additional permissions beyond Reader |
+|--------|----------------------|-----------------|--------------------|--------------------------------------|
+| `Get-AzServiceInventory.ps1` | `az graph query` | Reader (subscription) | Yes | None |
+| `Get-AzRegionCapabilities.ps1` | `az vm list-skus`, `az account list-locations` | Reader (subscription) | Yes | None |
+| `Get-AzQuotaUsage.ps1` | `az graph query`, `az vm list-usage`, `az network list-usages`, `az storage account list` | Reader (subscription) | Yes | None |
+| `Get-AzUsageTrends.ps1` | `az graph query`, `az monitor metrics list` | Reader (subscription) | Yes | None |
+| `Get-AzReservedInstances.ps1` | `az reservations reservation-order list`, reservation REST fallback | Reader (subscription) + Reservations Reader (tenant or billing scope) | No | `Microsoft.Capacity/reservationOrders/read` via **Reservations Reader** |
+| `Start-AzCapacityReport.ps1` | Runs all scripts above | Reader for core scripts; add Reservations Reader for full reservation coverage | No, not if Reserved Instances is included | Use `-SkipElevated` to run only Reader-scoped scripts |
+
+> **Tip**: If you only have Reader on the subscription, run `Start-AzCapacityReport.ps1 -SkipElevated` to skip `Get-AzReservedInstances.ps1`.
 
 ## Scripts
 
@@ -34,12 +53,16 @@ The orchestrator creates a timestamped directory (e.g., `reports/capacity-report
 
 Runs all five data collection scripts and generates a consolidated markdown summary. Supports single or multi-subscription operation.
 
+- **Core scripts (Reader only)**: Service Inventory, Region Capabilities, Quota Usage, Usage Trends
+- **Elevated script**: Reserved Instances
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `-SubscriptionId` | Current subscription | Target Azure subscription (single mode) |
 | `-SubscriptionFile` | — | Path to a text file listing subscription IDs (multi mode) |
 | `-OutputPath` | Current directory | Root directory for report output |
 | `-DaysBack` | `30` | Number of days for usage trend metrics |
+| `-SkipElevated` | `False` | Skip scripts that need permissions beyond Reader (`Get-AzReservedInstances.ps1`) |
 
 > **Note**: `-SubscriptionId` and `-SubscriptionFile` are mutually exclusive. If neither is provided, the current `az` subscription is used.
 
@@ -189,7 +212,7 @@ Lists active Azure reservations with scope, term, expiration, and utilization da
 - Expiration dates with days-until-expiry calculation
 - Reservations expiring within 90 days flagged
 
-**Permissions**: Requires `Microsoft.Capacity/reservationOrders/read` at the billing scope. If the current identity lacks this permission, the script produces a valid output with clear permission warnings instead of failing.
+**Permissions**: Requires `Microsoft.Capacity/reservationOrders/read`, exposed through the built-in **Reservations Reader** role at the tenant or billing scope. If the current identity lacks this permission, the script returns a valid JSON payload with `status: "skipped"` and a clear permissions message instead of failing.
 
 ## Output Format
 
