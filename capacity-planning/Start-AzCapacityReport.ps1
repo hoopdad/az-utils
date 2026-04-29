@@ -15,7 +15,307 @@ param(
 
     [Parameter()]
     [switch]$SkipElevated
+
 )
+
+$script:piiMap = @{}
+$script:piiCounters = @{
+    SubscriptionId   = 0
+    SubscriptionName = 0
+    TenantId         = 0
+    Email            = 0
+    ObjectId         = 0
+    ResourceGroup    = 0
+    StorageAccount   = 0
+    Guid             = 0
+}
+$script:logBuilder = [System.Text.StringBuilder]::new()
+$script:guidPattern = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+$script:emailPattern = '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b'
+
+function New-PiiPseudonym {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('SubscriptionId', 'SubscriptionName', 'TenantId', 'Email', 'ObjectId', 'ResourceGroup', 'StorageAccount', 'Guid')]
+        [string]$Category
+    )
+
+    $script:piiCounters[$Category] = [int]$script:piiCounters[$Category] + 1
+    $index = $script:piiCounters[$Category]
+
+    switch ($Category) {
+        'SubscriptionId' { return "Subscription-$index" }
+        'SubscriptionName' { return "SubName-$index" }
+        'TenantId' { return "Tenant-$index" }
+        'Email' { return "user-$index@example.com" }
+        'ObjectId' { return "ObjectId-$index" }
+        'ResourceGroup' { return "ResourceGroup-$index" }
+        'StorageAccount' { return "StorageAccount-$index" }
+        'Guid' { return "GUID-$index" }
+    }
+}
+
+function Register-Pii {
+    param(
+        [AllowNull()]
+        [string]$Value,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('SubscriptionId', 'SubscriptionName', 'TenantId', 'Email', 'ObjectId', 'ResourceGroup', 'StorageAccount', 'Guid')]
+        [string]$Category
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    $trimmedValue = $Value.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmedValue)) {
+        return $null
+    }
+
+    if ($Category -eq 'ResourceGroup' -and $trimmedValue -eq 'global') {
+        return $trimmedValue
+    }
+
+    if ($script:piiMap.ContainsKey($trimmedValue)) {
+        return $script:piiMap[$trimmedValue]
+    }
+
+    $pseudonym = New-PiiPseudonym -Category $Category
+    $script:piiMap[$trimmedValue] = $pseudonym
+    return $pseudonym
+}
+
+function Register-PiiFromResourceId {
+    param([string]$ResourceId)
+
+    if ([string]::IsNullOrWhiteSpace($ResourceId)) {
+        return
+    }
+
+    $subscriptionMatch = [regex]::Match($ResourceId, "/subscriptions/(?<subscription>$($script:guidPattern))", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($subscriptionMatch.Success) {
+        Register-Pii -Value $subscriptionMatch.Groups['subscription'].Value -Category 'SubscriptionId' | Out-Null
+    }
+
+    $resourceGroupMatch = [regex]::Match($ResourceId, '/resourceGroups/(?<resourceGroup>[^/]+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($resourceGroupMatch.Success) {
+        Register-Pii -Value $resourceGroupMatch.Groups['resourceGroup'].Value -Category 'ResourceGroup' | Out-Null
+    }
+
+    $storageAccountMatch = [regex]::Match($ResourceId, '/storageAccounts/(?<storageAccount>[^/]+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($storageAccountMatch.Success) {
+        Register-Pii -Value $storageAccountMatch.Groups['storageAccount'].Value -Category 'StorageAccount' | Out-Null
+    }
+}
+
+function Register-PiiFromProperties {
+    param(
+        [AllowNull()]
+        [object]$InputObject,
+
+        [AllowNull()]
+        [string]$TypeHint,
+
+        [AllowNull()]
+        [string]$NameHint
+    )
+
+    if ($null -eq $InputObject) {
+        return
+    }
+
+    if ($InputObject -is [string]) {
+        $text = [string]$InputObject
+        foreach ($emailMatch in [regex]::Matches($text, $script:emailPattern)) {
+            Register-Pii -Value $emailMatch.Value -Category 'Email' | Out-Null
+        }
+        if ($text -match '(?i)^/subscriptions/') {
+            Register-PiiFromResourceId -ResourceId $text
+        }
+        return
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string]) -and -not ($InputObject -is [System.Collections.IDictionary])) {
+        foreach ($item in $InputObject) {
+            Register-PiiFromProperties -InputObject $item
+        }
+        return
+    }
+
+    $propertyEntries = @()
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($key in $InputObject.Keys) {
+            $propertyEntries += [pscustomobject]@{
+                Name  = [string]$key
+                Value = $InputObject[$key]
+            }
+        }
+    }
+    else {
+        $propertyEntries = @($InputObject.PSObject.Properties | Where-Object { $_.MemberType -in @('NoteProperty', 'Property') } | ForEach-Object {
+            [pscustomobject]@{
+                Name  = [string]$_.Name
+                Value = $_.Value
+            }
+        })
+    }
+
+    if ($propertyEntries.Count -eq 0) {
+        return
+    }
+
+    $effectiveType = $TypeHint
+    if ([string]::IsNullOrWhiteSpace($effectiveType)) {
+        $typeProperty = $propertyEntries | Where-Object { $_.Name -in @('type', 'resourceType') } | Select-Object -First 1
+        if ($null -ne $typeProperty -and -not [string]::IsNullOrWhiteSpace([string]$typeProperty.Value)) {
+            $effectiveType = [string]$typeProperty.Value
+        }
+    }
+
+    $effectiveName = $NameHint
+    if ([string]::IsNullOrWhiteSpace($effectiveName)) {
+        $nameProperty = $propertyEntries | Where-Object { $_.Name -eq 'name' } | Select-Object -First 1
+        if ($null -ne $nameProperty -and -not [string]::IsNullOrWhiteSpace([string]$nameProperty.Value)) {
+            $effectiveName = [string]$nameProperty.Value
+        }
+    }
+
+    foreach ($propertyEntry in $propertyEntries) {
+        $name = $propertyEntry.Name
+        $value = $propertyEntry.Value
+
+        switch -Regex ($name) {
+            '^subscriptionId$' {
+                Register-Pii -Value ([string]$value) -Category 'SubscriptionId' | Out-Null
+                continue
+            }
+            '^subscriptionName$' {
+                Register-Pii -Value ([string]$value) -Category 'SubscriptionName' | Out-Null
+                continue
+            }
+            '^tenantId$' {
+                Register-Pii -Value ([string]$value) -Category 'TenantId' | Out-Null
+                continue
+            }
+            '^(objectId|principalId)$' {
+                Register-Pii -Value ([string]$value) -Category 'ObjectId' | Out-Null
+                continue
+            }
+            '^(email|userPrincipalName|principalName)$' {
+                Register-Pii -Value ([string]$value) -Category 'Email' | Out-Null
+                continue
+            }
+            '^(resourceGroup|resourceGroupName)$' {
+                Register-Pii -Value ([string]$value) -Category 'ResourceGroup' | Out-Null
+                continue
+            }
+            '^(storageAccount|storageAccountName)$' {
+                Register-Pii -Value ([string]$value) -Category 'StorageAccount' | Out-Null
+                continue
+            }
+            '^(id|resourceId)$' {
+                Register-PiiFromResourceId -ResourceId ([string]$value)
+            }
+        }
+
+        Register-PiiFromProperties -InputObject $value
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($effectiveType) -and $effectiveType -match 'Microsoft\.Storage/storageAccounts' -and -not [string]::IsNullOrWhiteSpace($effectiveName)) {
+        Register-Pii -Value $effectiveName -Category 'StorageAccount' | Out-Null
+    }
+}
+
+function ConvertTo-Obfuscated {
+    param(
+        [AllowNull()]
+        [string]$Text
+    )
+
+    if ($null -eq $Text) {
+        return ''
+    }
+
+    $obfuscated = [string]$Text
+
+    foreach ($match in [regex]::Matches($obfuscated, '(?i)/subscriptions/' + $script:guidPattern + '/resourceGroups/[^\s]+')) {
+        Register-PiiFromResourceId -ResourceId $match.Value
+    }
+
+    foreach ($match in [regex]::Matches($obfuscated, '(?i)(?:tenant(?:\s+id)?|tenantId)[^0-9a-fA-F]*(?<tenant>' + $script:guidPattern + ')')) {
+        Register-Pii -Value $match.Groups['tenant'].Value -Category 'TenantId' | Out-Null
+    }
+
+    foreach ($match in [regex]::Matches($obfuscated, '(?i)(?:object(?:\s+id)?|principal(?:\s+id)?|objectId|principalId)[^0-9a-fA-F]*(?<object>' + $script:guidPattern + ')')) {
+        Register-Pii -Value $match.Groups['object'].Value -Category 'ObjectId' | Out-Null
+    }
+
+    foreach ($emailMatch in [regex]::Matches($obfuscated, $script:emailPattern)) {
+        Register-Pii -Value $emailMatch.Value -Category 'Email' | Out-Null
+    }
+
+    foreach ($guidMatch in [regex]::Matches($obfuscated, $script:guidPattern)) {
+        Register-Pii -Value $guidMatch.Value -Category 'Guid' | Out-Null
+    }
+
+    $obfuscated = [regex]::Replace($obfuscated, '(?i)([A-Z]:\\Users\\)[^\\]+', '$1<user>')
+    $obfuscated = [regex]::Replace($obfuscated, '(?i)(/home/)[^/\s]+', '$1<user>')
+
+    $replacementEntries = @($script:piiMap.GetEnumerator() | Sort-Object { $_.Key.Length } -Descending)
+    foreach ($entry in $replacementEntries) {
+        $obfuscated = [regex]::Replace(
+            $obfuscated,
+            [regex]::Escape([string]$entry.Key),
+            [System.Text.RegularExpressions.MatchEvaluator]{ param($match) [string]$entry.Value },
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    }
+
+    return $obfuscated
+}
+
+function Add-LogEntry {
+    param(
+        [AllowNull()]
+        [string]$Message = '',
+
+        [Parameter()]
+        [switch]$NoNewline
+    )
+
+    [void]$script:logBuilder.Append((ConvertTo-Obfuscated -Text $Message))
+    if (-not $NoNewline) {
+        [void]$script:logBuilder.AppendLine()
+    }
+}
+
+function Write-Log {
+    param(
+        [AllowNull()]
+        [object]$Message = '',
+
+        [Parameter()]
+        [System.ConsoleColor]$ForegroundColor,
+
+        [Parameter()]
+        [switch]$NoNewline
+    )
+
+    $text = if ($null -eq $Message) { '' } else { [string]$Message }
+
+    $writeHostParams = @{ Object = $text }
+    if ($PSBoundParameters.ContainsKey('ForegroundColor')) {
+        $writeHostParams['ForegroundColor'] = $ForegroundColor
+    }
+    if ($NoNewline) {
+        $writeHostParams['NoNewline'] = $true
+    }
+
+    Write-Host @writeHostParams
+    Add-LogEntry -Message $text -NoNewline:$NoNewline
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -223,20 +523,20 @@ function Invoke-CapacityCollection {
 
     New-Item -ItemType Directory -Path $ReportDir -Force | Out-Null
 
-    Write-Host "`nSubscription: $SubName ($SubId)" -ForegroundColor Green
-    Write-Host "Report directory: $ReportDir"
-    Write-Host "Metrics window: $DaysBack days"
+    Write-Log "`nSubscription: $SubName ($SubId)" -ForegroundColor Green
+    Write-Log "Report directory: $ReportDir"
+    Write-Log "Metrics window: $DaysBack days"
     if ($SkipElevated) {
-        Write-Host 'Elevated scripts: skipped by request (-SkipElevated)' -ForegroundColor Yellow
+        Write-Log 'Elevated scripts: skipped by request (-SkipElevated)' -ForegroundColor Yellow
     }
-    Write-Host ''
+    Write-Log ''
 
     $results = @{}
 
     foreach ($s in $scriptDefs) {
         $scriptPath = Join-Path $scriptDir $s.File
         if (-not (Test-Path $scriptPath)) {
-            Write-Host "  [SKIP] $($s.Name) - script not found: $($s.File)" -ForegroundColor Yellow
+            Write-Log "  [SKIP] $($s.Name) - script not found: $($s.File)" -ForegroundColor Yellow
             $results[$s.Name] = @{
                 Status          = 'skipped'
                 Duration        = $null
@@ -253,7 +553,7 @@ function Invoke-CapacityCollection {
 
         if ($SkipElevated -and $s.Elevated) {
             $note = "Skipped by -SkipElevated. Requires $($s.RequiredRole)."
-            Write-Host "  [SKIP] $($s.Name) - $note" -ForegroundColor Yellow
+            Write-Log "  [SKIP] $($s.Name) - $note" -ForegroundColor Yellow
             $results[$s.Name] = @{
                 Status           = 'skipped'
                 Duration         = 0
@@ -268,7 +568,7 @@ function Invoke-CapacityCollection {
             continue
         }
 
-        Write-Host "Running: $($s.Name)..." -ForegroundColor Cyan -NoNewline
+        Write-Log "Running: $($s.Name)..." -ForegroundColor Cyan -NoNewline
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
         try {
@@ -296,11 +596,12 @@ function Invoke-CapacityCollection {
                     RequiredRole     = $s.RequiredRole
                     RequiresElevated = $s.Elevated
                 }
-                Write-Host ' FAILED (no output file)' -ForegroundColor Red
+                Write-Log ' FAILED (no output file)' -ForegroundColor Red
                 continue
             }
 
             $data = Get-Content $outputFile -Raw | ConvertFrom-Json -Depth 100
+            Register-PiiFromProperties -InputObject $data
             $metadata = Get-PropertyValue -InputObject $data -PropertyName 'metadata'
             $errs = @()
             $warns = @()
@@ -316,7 +617,7 @@ function Invoke-CapacityCollection {
             if (Test-IsPermissionIssue -Data $data -ScriptDef $s) {
                 $status = 'permission-failed'
                 $note = Get-PermissionNote -Data $data -DefaultMessage "Insufficient permissions. Requires $($s.RequiredRole)."
-                Write-Host " permission issue ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
+                Write-Log " permission issue ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
             }
             elseif ([string](Get-PropertyValue -InputObject $data -PropertyName 'status') -eq 'skipped') {
                 $status = 'skipped'
@@ -324,10 +625,10 @@ function Invoke-CapacityCollection {
                 if ([string]::IsNullOrWhiteSpace($note)) {
                     $note = 'Script reported a skip condition.'
                 }
-                Write-Host " skipped ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
+                Write-Log " skipped ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
             }
             else {
-                Write-Host " done ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Green
+                Write-Log " done ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Green
             }
 
             $results[$s.Name] = @{
@@ -368,12 +669,12 @@ function Invoke-CapacityCollection {
             }
 
             if ($isPermission) {
-                Write-Host " PERMISSION ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
-                Write-Host "    Requires: $($s.RequiredRole)" -ForegroundColor Yellow
+                Write-Log " PERMISSION ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
+                Write-Log "    Requires: $($s.RequiredRole)" -ForegroundColor Yellow
             }
             else {
-                Write-Host " FAILED ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Red
-                Write-Host "    Error: $message" -ForegroundColor Red
+                Write-Log " FAILED ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Red
+                Write-Log "    Error: $message" -ForegroundColor Red
             }
         }
     }
@@ -565,9 +866,9 @@ function New-SubscriptionSummary {
 
 # --- Main execution ---
 
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host ' Azure Capacity Planning Report' -ForegroundColor Cyan
-Write-Host '========================================' -ForegroundColor Cyan
+Write-Log "`n========================================" -ForegroundColor Cyan
+Write-Log ' Azure Capacity Planning Report' -ForegroundColor Cyan
+Write-Log '========================================' -ForegroundColor Cyan
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 # Build list of subscriptions to process
@@ -583,19 +884,24 @@ if ($PSCmdlet.ParameterSetName -eq 'File') {
         $subscriptions += @{ Id = $id; Name = $name }
     }
     if ($subscriptions.Count -eq 0) {
+        Add-LogEntry -Message "No valid subscription IDs found in '$SubscriptionFile'."
         Write-Error "No valid subscription IDs found in '$SubscriptionFile'."
         return
     }
-    Write-Host "`nLoaded $($subscriptions.Count) subscription(s) from: $SubscriptionFile" -ForegroundColor Green
+    Write-Log "`nLoaded $($subscriptions.Count) subscription(s) from: $SubscriptionFile" -ForegroundColor Green
 }
 else {
     if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
         $accountJson = az account show -o json 2>&1
         if ($LASTEXITCODE -ne 0) {
+            Add-LogEntry -Message "Not logged in to Azure CLI. Run 'az login' first."
             Write-Error "Not logged in to Azure CLI. Run 'az login' first."
             return
         }
         $account = $accountJson | ConvertFrom-Json
+        Register-Pii -Value $account.id -Category 'SubscriptionId' | Out-Null
+        Register-Pii -Value $account.name -Category 'SubscriptionName' | Out-Null
+        Register-Pii -Value $account.tenantId -Category 'TenantId' | Out-Null
         $subscriptions += @{ Id = $account.id; Name = $account.name }
     }
     else {
@@ -608,10 +914,14 @@ $allSubResults = @()
 
 foreach ($sub in $subscriptions) {
     $subId = $sub.Id
+    Register-Pii -Value $subId -Category 'SubscriptionId' | Out-Null
+    if (-not [string]::IsNullOrWhiteSpace([string]$sub.Name)) {
+        Register-Pii -Value $sub.Name -Category 'SubscriptionName' | Out-Null
+    }
 
     az account set --subscription $subId 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "`n❌ Failed to set subscription: $subId" -ForegroundColor Red
+        Write-Log "`n❌ Failed to set subscription: $subId" -ForegroundColor Red
         $allSubResults += @{
             Id     = $subId
             Name   = $sub.Name
@@ -623,6 +933,10 @@ foreach ($sub in $subscriptions) {
 
     $account = az account show -o json | ConvertFrom-Json
     $subName = $account.name
+    Register-Pii -Value $subId -Category 'SubscriptionId' | Out-Null
+    Register-Pii -Value $subName -Category 'SubscriptionName' | Out-Null
+    Register-Pii -Value $account.tenantId -Category 'TenantId' | Out-Null
+
 
     if ($subscriptions.Count -gt 1) {
         $safeName = ($subName -replace '[^\w\-]', '_').ToLower()
@@ -632,9 +946,9 @@ foreach ($sub in $subscriptions) {
         $subReportDir = Join-Path $OutputPath "capacity-report-$timestamp"
     }
 
-    Write-Host "`n----------------------------------------" -ForegroundColor DarkGray
-    Write-Host " [$($subscriptions.IndexOf($sub) + 1)/$($subscriptions.Count)] $subName" -ForegroundColor Cyan
-    Write-Host '----------------------------------------' -ForegroundColor DarkGray
+    Write-Log "`n----------------------------------------" -ForegroundColor DarkGray
+    Write-Log " [$($subscriptions.IndexOf($sub) + 1)/$($subscriptions.Count)] $subName" -ForegroundColor Cyan
+    Write-Log '----------------------------------------' -ForegroundColor DarkGray
 
     $results = Invoke-CapacityCollection -SubId $subId -SubName $subName -ReportDir $subReportDir
     $summaryPath = New-SubscriptionSummary -SubId $subId -SubName $subName -ReportDir $subReportDir -Results $results
@@ -655,7 +969,7 @@ foreach ($sub in $subscriptions) {
 
     $summaryText = Format-ResultSummary -Success $counts.Success -PermissionFailures $counts.PermissionFailures -ScriptFailures $counts.ScriptFailures -Skipped $counts.Skipped
     $summaryColor = if ($counts.ScriptFailures -gt 0) { 'Yellow' } elseif ($counts.PermissionFailures -gt 0 -or $counts.Skipped -gt 0) { 'Yellow' } else { 'Green' }
-    Write-Host "`nScripts: $summaryText" -ForegroundColor $summaryColor
+    Write-Log "`nScripts: $summaryText" -ForegroundColor $summaryColor
 }
 
 # Cross-subscription summary (when processing multiple subscriptions)
@@ -775,23 +1089,24 @@ if ($subscriptions.Count -gt 1) {
 }
 
 # Final output
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host ' Report Complete' -ForegroundColor Cyan
-Write-Host '========================================' -ForegroundColor Cyan
+Write-Log "`n========================================" -ForegroundColor Cyan
+Write-Log ' Report Complete' -ForegroundColor Cyan
+Write-Log '========================================' -ForegroundColor Cyan
 
 $rootReportDir = Join-Path $OutputPath "capacity-report-$timestamp"
-Write-Host "`nReport directory: $rootReportDir" -ForegroundColor Green
+New-Item -ItemType Directory -Path $rootReportDir -Force | Out-Null
+Write-Log "`nReport directory: $rootReportDir" -ForegroundColor Green
 
 if ($subscriptions.Count -gt 1) {
-    Write-Host "Cross-subscription summary: $(Join-Path $rootReportDir 'cross-subscription-summary.md')"
+    Write-Log "Cross-subscription summary: $(Join-Path $rootReportDir 'cross-subscription-summary.md')"
     $completedCount = @($allSubResults | Where-Object { $_.Status -eq 'completed' }).Count
     $failedCount = @($allSubResults | Where-Object { $_.Status -eq 'failed' }).Count
-    Write-Host "`nSubscriptions: $completedCount completed, $failedCount failed" -ForegroundColor $(if ($failedCount -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Log "`nSubscriptions: $completedCount completed, $failedCount failed" -ForegroundColor $(if ($failedCount -gt 0) { 'Yellow' } else { 'Green' })
 }
 else {
     $r = $allSubResults[0]
-    Write-Host "Summary: $($r.SummaryPath)"
-    Write-Host "`nScripts: $(Format-ResultSummary -Success $r.SuccessCount -PermissionFailures $r.PermissionFailureCount -ScriptFailures $r.ScriptFailureCount -Skipped $r.SkipCount)" -ForegroundColor $(if ($r.ScriptFailureCount -gt 0) { 'Yellow' } elseif ($r.PermissionFailureCount -gt 0 -or $r.SkipCount -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Log "Summary: $($r.SummaryPath)"
+    Write-Log "`nScripts: $(Format-ResultSummary -Success $r.SuccessCount -PermissionFailures $r.PermissionFailureCount -ScriptFailures $r.ScriptFailureCount -Skipped $r.SkipCount)" -ForegroundColor $(if ($r.ScriptFailureCount -gt 0) { 'Yellow' } elseif ($r.PermissionFailureCount -gt 0 -or $r.SkipCount -gt 0) { 'Yellow' } else { 'Green' })
 }
 
 # Generate Excel report
@@ -799,7 +1114,7 @@ $excelScript = Join-Path $scriptDir 'convert_to_excel.py'
 $excelOutput = Join-Path $rootReportDir 'capacity-report.xlsx'
 
 if (Test-Path $excelScript) {
-    Write-Host "`nGenerating Excel report..." -ForegroundColor Cyan
+    Write-Log "`nGenerating Excel report..." -ForegroundColor Cyan
 
     $pythonCmd = $null
     foreach ($candidate in @('python3', 'python', 'py')) {
@@ -818,7 +1133,7 @@ if (Test-Path $excelScript) {
         try {
             $checkImport = & $pythonCmd -c "import openpyxl" 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-Host '  Installing openpyxl...' -ForegroundColor Yellow
+                Write-Log '  Installing openpyxl...' -ForegroundColor Yellow
                 & $pythonCmd -m pip install openpyxl --quiet --break-system-packages 2>$null
                 if ($LASTEXITCODE -ne 0) {
                     & $pythonCmd -m pip install openpyxl --quiet 2>$null
@@ -828,22 +1143,27 @@ if (Test-Path $excelScript) {
             & $pythonCmd $excelScript $rootReportDir $excelOutput
             if ($LASTEXITCODE -eq 0 -and (Test-Path $excelOutput)) {
                 $excelSize = [math]::Round((Get-Item $excelOutput).Length / 1024, 1)
-                Write-Host "  ✅ Excel report: $excelOutput ($excelSize KB)" -ForegroundColor Green
+                Write-Log "  ✅ Excel report: $excelOutput ($excelSize KB)" -ForegroundColor Green
             }
             else {
-                Write-Host '  ⚠️  Excel generation failed' -ForegroundColor Yellow
+                Write-Log '  ⚠️  Excel generation failed' -ForegroundColor Yellow
             }
         }
         catch {
-            Write-Host "  ⚠️  Excel generation failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Log "  ⚠️  Excel generation failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
     else {
-        Write-Host '  ⚠️  Python not found - skipping Excel generation' -ForegroundColor Yellow
-        Write-Host '     Install Python and openpyxl, then run manually:' -ForegroundColor Gray
-        Write-Host "     python3 $excelScript $rootReportDir" -ForegroundColor Gray
+        Write-Log '  ⚠️  Python not found - skipping Excel generation' -ForegroundColor Yellow
+        Write-Log '     Install Python and openpyxl, then run manually:' -ForegroundColor Gray
+        Write-Log "     python3 $excelScript $rootReportDir" -ForegroundColor Gray
     }
 }
 else {
-    Write-Host "`n⚠️  convert_to_excel.py not found - skipping Excel generation" -ForegroundColor Yellow
+    Write-Log "`n⚠️  convert_to_excel.py not found - skipping Excel generation" -ForegroundColor Yellow
 }
+
+# Write obfuscated log
+$logPath = Join-Path $rootReportDir 'obfuscated-log.txt'
+$script:logBuilder.ToString() | Out-File -FilePath $logPath -Encoding utf8
+Write-Host "`nObfuscated log: $logPath" -ForegroundColor Green

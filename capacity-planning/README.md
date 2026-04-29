@@ -106,6 +106,12 @@ The cross-subscription summary includes:
 - Aggregated high-utilization resources across all subscriptions
 - Links to per-subscription reports
 
+#### Obfuscated Log
+
+`Start-AzCapacityReport.ps1` also writes an `obfuscated-log.txt` file into the top-level report directory automatically. It captures the orchestrator's console output with sensitive values replaced by consistent pseudonyms, so you can safely share the log in support tickets, with consultants, or in other external troubleshooting threads.
+
+The obfuscation currently covers subscription IDs and names, tenant/object GUIDs, email addresses, resource group names, storage account names, user home-directory paths, and resource IDs that embed subscription/resource group details.
+
 ---
 
 ### Get-AzServiceInventory.ps1 — Resource Inventory
