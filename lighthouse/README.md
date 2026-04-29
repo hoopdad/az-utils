@@ -1,6 +1,6 @@
 # Azure Lighthouse Onboarding
 
-PowerShell script using Azure CLI to onboard subscriptions for Azure Lighthouse. Registers the `Microsoft.ManagedServices` resource provider and assigns **Reader** and **Reservations Reader** roles to specified users at the subscription scope.
+PowerShell script using Azure CLI to onboard subscriptions for Azure Lighthouse. Registers the `Microsoft.ManagedServices` resource provider and assigns the **Reader** role to specified users at the subscription scope.
 
 ## Quick Start
 
@@ -41,9 +41,7 @@ pwsh Set-AzLighthouseOnboarding.ps1 -SubscriptionFile subscriptions.txt -UsersFi
 For each subscription:
 
 1. **Registers `Microsoft.ManagedServices`** resource provider (waits for registration to complete)
-2. **Assigns roles** to each user at subscription scope:
-   - **Reader** (`acdd72a7-3385-48ef-bd42-f606fba81ae7`)
-   - **Reservations Reader** (`582fc458-8989-419f-a480-75249bc5db7e`)
+2. **Assigns Reader role** to each user at subscription scope (`acdd72a7-3385-48ef-bd42-f606fba81ae7`)
 
 ## File Formats
 

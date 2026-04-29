@@ -217,8 +217,7 @@ function Test-IsAlreadyExistsError {
 }
 
 $roleDefinitions = @(
-    @{ Id = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'; Name = 'Reader'; Scope = 'subscription' },
-    @{ Id = '582fc458-8989-419f-a480-75249bc5db7e'; Name = 'Reservations Reader'; Scope = 'tenant' }
+    @{ Id = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'; Name = 'Reader' }
 )
 $scriptErrors = New-Object System.Collections.Generic.List[string]
 $subscriptionErrors = New-Object System.Collections.Generic.List[string]
@@ -266,31 +265,29 @@ foreach ($subscriptionTarget in $subscriptionTargets) {
         Write-Status "Microsoft.ManagedServices is registered for '$targetSubscriptionId'." Green
 
         $subscriptionScope = "/subscriptions/$targetSubscriptionId"
-        $tenantScope = '/providers/Microsoft.Capacity'
         foreach ($resolvedUser in $resolvedUsers) {
             foreach ($roleDef in $roleDefinitions) {
                 $roleId = $roleDef.Id
                 $roleName = $roleDef.Name
-                $scope = if ($roleDef.Scope -eq 'tenant') { $tenantScope } else { $subscriptionScope }
                 try {
                     Invoke-AzJson -Arguments @(
                         'role', 'assignment', 'create',
                         '--assignee-object-id', [string]$resolvedUser.ObjectId,
                         '--assignee-principal-type', 'User',
                         '--role', $roleId,
-                        '--scope', $scope,
+                        '--scope', $subscriptionScope,
                         '--output', 'json',
                         '--only-show-errors'
                     ) | Out-Null
 
                     $roleAssignmentsCreated++
-                    Write-Status "Assigned '$roleName' to '$($resolvedUser.Email)' at scope '$scope'." Green
+                    Write-Status "Assigned '$roleName' to '$($resolvedUser.Email)' on '$targetSubscriptionId'." Green
                 }
                 catch {
                     $errorMessage = $_.Exception.Message
                     if (Test-IsAlreadyExistsError -Message $errorMessage) {
                         $roleAssignmentsSkipped++
-                        Write-Status "'$roleName' is already assigned to '$($resolvedUser.Email)' at scope '$scope'. Skipping." Yellow
+                        Write-Status "'$roleName' is already assigned to '$($resolvedUser.Email)' on '$targetSubscriptionId'. Skipping." Yellow
                         continue
                     }
 

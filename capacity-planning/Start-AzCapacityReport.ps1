@@ -14,9 +14,6 @@ param(
     [int]$DaysBack = 30,
 
     [Parameter()]
-    [switch]$SkipElevated,
-
-    [Parameter()]
     [ValidateRange(1, 32)]
     [int]$MaxParallel = 3,
 
@@ -337,11 +334,11 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = $PSScriptRoot
 
 $scriptDefs = @(
-    [pscustomobject]@{ Name = 'Service Inventory';   File = 'Get-AzServiceInventory.ps1';   Output = 'service-inventory.json';   Category = 'Core';     RequiredRole = 'Reader';                                               Elevated = $false }
-    [pscustomobject]@{ Name = 'Region Capabilities'; File = 'Get-AzRegionCapabilities.ps1'; Output = 'region-capabilities.json'; Category = 'Core';     RequiredRole = 'Reader';                                               Elevated = $false }
-    [pscustomobject]@{ Name = 'Quota Usage';         File = 'Get-AzQuotaUsage.ps1';         Output = 'quota-usage.json';         Category = 'Core';     RequiredRole = 'Reader';                                               Elevated = $false }
-    [pscustomobject]@{ Name = 'Usage Trends';        File = 'Get-AzUsageTrends.ps1';        Output = 'usage-trends.json';        Category = 'Core';     RequiredRole = 'Reader';                                               Elevated = $false }
-    [pscustomobject]@{ Name = 'Reserved Instances';  File = 'Get-AzReservedInstances.ps1';  Output = 'reserved-instances.json';  Category = 'Elevated'; RequiredRole = 'Reservations Reader (tenant or billing scope)'; Elevated = $true }
+    [pscustomobject]@{ Name = 'Service Inventory';   File = 'Get-AzServiceInventory.ps1';   Output = 'service-inventory.json';   RequiredRole = 'Reader' }
+    [pscustomobject]@{ Name = 'Region Capabilities'; File = 'Get-AzRegionCapabilities.ps1'; Output = 'region-capabilities.json'; RequiredRole = 'Reader' }
+    [pscustomobject]@{ Name = 'Quota Usage';         File = 'Get-AzQuotaUsage.ps1';         Output = 'quota-usage.json';         RequiredRole = 'Reader' }
+    [pscustomobject]@{ Name = 'Usage Trends';        File = 'Get-AzUsageTrends.ps1';        Output = 'usage-trends.json';        RequiredRole = 'Reader' }
+    [pscustomobject]@{ Name = 'Reserved Instances';  File = 'Get-AzReservedInstances.ps1';  Output = 'reserved-instances.json';  RequiredRole = 'Reader' }
 )
 
 function Get-PropertyValue {
@@ -437,7 +434,7 @@ function Test-IsPermissionIssue {
         }
     }
 
-    if ($null -ne $Data -and $null -ne $ScriptDef -and $ScriptDef.Elevated) {
+    if ($null -ne $Data) {
         $status = [string](Get-PropertyValue -InputObject $Data -PropertyName 'status')
         $reason = [string](Get-PropertyValue -InputObject $Data -PropertyName 'reason')
         if ($status -eq 'skipped' -and $reason -match 'permission') {
@@ -546,7 +543,6 @@ function Resolve-CapacityScriptResult {
         Note             = $null
         Category         = [string]$ScriptRun.Category
         RequiredRole     = [string]$ScriptRun.RequiredRole
-        RequiresElevated = [bool]$ScriptRun.Elevated
         OutputLines      = @($ScriptRun.OutputLines)
     }
 
@@ -791,9 +787,6 @@ function Invoke-CapacityCollection {
     Write-Log "`nSubscription: $SubName ($SubId)" -ForegroundColor Green
     Write-Log "Report directory: $ReportDir"
     Write-Log "Metrics window: $DaysBack days"
-    if ($SkipElevated) {
-        Write-Log 'Elevated scripts: skipped by request (-SkipElevated)' -ForegroundColor Yellow
-    }
     Write-Log ''
 
     $results = @{}
@@ -803,9 +796,8 @@ function Invoke-CapacityCollection {
         $scriptRun = [ordered]@{
             Name            = $s.Name
             Output          = $s.Output
-            Category        = $s.Category
+            Category        = 'Core'
             RequiredRole    = $s.RequiredRole
-            Elevated        = $s.Elevated
             Duration        = $null
             ExecutionStatus = 'completed'
             InvocationError = $null
@@ -815,11 +807,6 @@ function Invoke-CapacityCollection {
 
         if (-not (Test-Path -LiteralPath $scriptPath)) {
             $scriptRun.ExecutionStatus = 'missing'
-        }
-        elseif ($SkipElevated -and $s.Elevated) {
-            $scriptRun.ExecutionStatus = 'skipped'
-            $scriptRun.Note = "Skipped by -SkipElevated. Requires $($s.RequiredRole)."
-            $scriptRun.Duration = 0
         }
         else {
             $splatParams = @{
@@ -871,8 +858,7 @@ function New-SubscriptionSummary {
     )
 
     $counts = Get-ResultCounts -Results $Results
-    $coreScriptNames = @($scriptDefs | Where-Object { -not $_.Elevated } | ForEach-Object { $_.Name })
-    $elevatedScriptNames = @($scriptDefs | Where-Object { $_.Elevated } | ForEach-Object { $_.Name })
+    $scriptNames = @($scriptDefs | ForEach-Object { $_.Name })
 
     $md = [System.Text.StringBuilder]::new()
     [void]$md.AppendLine('# Azure Capacity Planning Report')
@@ -882,9 +868,7 @@ function New-SubscriptionSummary {
     [void]$md.AppendLine("| **Subscription** | $SubName ($SubId) |")
     [void]$md.AppendLine("| **Generated** | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') |")
     [void]$md.AppendLine("| **Metrics Window** | $DaysBack days |")
-    [void]$md.AppendLine("| **Core Scripts** | $($coreScriptNames -join ', ') |")
-    [void]$md.AppendLine("| **Elevated Scripts** | $($elevatedScriptNames -join ', ') |")
-    [void]$md.AppendLine("| **Skip Elevated** | $(if ($SkipElevated) { 'Yes' } else { 'No' }) |")
+    [void]$md.AppendLine("| **Scripts** | $($scriptNames -join ', ') |")
     [void]$md.AppendLine('')
 
     [void]$md.AppendLine('## Collection Status')
@@ -899,7 +883,7 @@ function New-SubscriptionSummary {
         $warnCount = if ($r.ContainsKey('Warnings') -and $r.Warnings) { @($r.Warnings).Count } else { 0 }
         $statusIcon = Get-StatusIcon -Status $r.Status
         $note = if ($r.ContainsKey('Note') -and -not [string]::IsNullOrWhiteSpace([string]$r.Note)) { [string]$r.Note } else { '' }
-        [void]$md.AppendLine("| $($s.Name) | $($s.Category) | $($s.RequiredRole) | $statusIcon $($r.Status) | $duration | $errCount | $warnCount | $note |")
+        [void]$md.AppendLine("| $($s.Name) | $($r.Category) | $($s.RequiredRole) | $statusIcon $($r.Status) | $duration | $errCount | $warnCount | $note |")
     }
     [void]$md.AppendLine('')
 
@@ -1188,9 +1172,8 @@ elseif ($subscriptions.Count -gt 1) {
                 $scriptRun = [pscustomobject]@{
                     Name            = $s.Name
                     Output          = $s.Output
-                    Category        = $s.Category
+                    Category        = 'Core'
                     RequiredRole    = $s.RequiredRole
-                    Elevated        = $s.Elevated
                     Duration        = $null
                     ExecutionStatus = 'completed'
                     InvocationError = $null
@@ -1200,14 +1183,6 @@ elseif ($subscriptions.Count -gt 1) {
 
                 if (-not (Test-Path -LiteralPath $scriptPath)) {
                     $scriptRun.ExecutionStatus = 'missing'
-                    $scriptRuns.Add($scriptRun) | Out-Null
-                    continue
-                }
-
-                if ($using:SkipElevated -and $s.Elevated) {
-                    $scriptRun.ExecutionStatus = 'skipped'
-                    $scriptRun.Duration = 0
-                    $scriptRun.Note = "Skipped by -SkipElevated. Requires $($s.RequiredRole)."
                     $scriptRuns.Add($scriptRun) | Out-Null
                     continue
                 }
@@ -1276,9 +1251,6 @@ elseif ($subscriptions.Count -gt 1) {
 
             Write-Log ("  [{0}/{1}] {2}... done ({3}s) - {4}" -f ($batchResult.Order + 1), $requestedSubscriptionCount, $batchResult.Name, [math]::Round([double]$batchResult.Duration, 1), $summaryText) -ForegroundColor $summaryColor
             Write-Log "    Report directory: $($batchResult.ReportDir)"
-            if ($SkipElevated) {
-                Write-Log '    Elevated scripts: skipped by request (-SkipElevated)' -ForegroundColor Yellow
-            }
 
             foreach ($s in $scriptDefs) {
                 $result = $subResults[$s.Name]
@@ -1316,7 +1288,6 @@ if ($requestedSubscriptionCount -gt 1) {
     [void]$crossMd.AppendLine("| **Generated** | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') |")
     [void]$crossMd.AppendLine("| **Subscriptions** | $requestedSubscriptionCount |")
     [void]$crossMd.AppendLine("| **Metrics Window** | $DaysBack days |")
-    [void]$crossMd.AppendLine("| **Skip Elevated** | $(if ($SkipElevated) { 'Yes' } else { 'No' }) |")
     [void]$crossMd.AppendLine("| **Sequential Mode** | $(if ($Sequential -or $MaxParallel -le 1) { 'Yes' } else { 'No' }) |")
     [void]$crossMd.AppendLine("| **Max Parallel** | $MaxParallel |")
     [void]$crossMd.AppendLine('')
