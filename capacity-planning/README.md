@@ -12,8 +12,12 @@ az login
 pwsh Start-AzCapacityReport.ps1 -OutputPath ./reports
 pwsh Start-AzCapacityReport.ps1 -SubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -OutputPath ./reports
 
-# Multiple subscriptions from a file
+# Multiple subscriptions from a file (parallel by default)
 pwsh Start-AzCapacityReport.ps1 -SubscriptionFile subscriptions.txt -OutputPath ./reports
+
+# Control cross-subscription parallelism
+pwsh Start-AzCapacityReport.ps1 -SubscriptionFile subscriptions.txt -OutputPath ./reports -MaxParallel 5
+pwsh Start-AzCapacityReport.ps1 -SubscriptionFile subscriptions.txt -OutputPath ./reports -Sequential
 
 # Skip scripts that need elevated reservation permissions
 pwsh Start-AzCapacityReport.ps1 -OutputPath ./reports -SkipElevated
@@ -23,7 +27,7 @@ pwsh Get-AzServiceInventory.ps1 -OutputPath ./reports
 pwsh Get-AzQuotaUsage.ps1 -OutputPath ./reports
 ```
 
-The orchestrator creates a timestamped directory (e.g., `reports/capacity-report-20260429-101347/`) containing JSON data files and a `summary.md` with key findings. When using `-SubscriptionFile`, each subscription gets its own subdirectory plus a `cross-subscription-summary.md` at the top level.
+The orchestrator creates a timestamped directory (e.g., `reports/capacity-report-20260429-101347/`) containing JSON data files and a `summary.md` with key findings. When using `-SubscriptionFile`, subscriptions are processed concurrently by default and each subscription gets its own subdirectory named with the subscription name plus the first eight characters of the subscription ID, along with a `cross-subscription-summary.md` at the top level.
 
 ## Prerequisites
 
@@ -63,6 +67,8 @@ Runs all five data collection scripts and generates a consolidated markdown summ
 | `-OutputPath` | Current directory | Root directory for report output |
 | `-DaysBack` | `30` | Number of days for usage trend metrics |
 | `-SkipElevated` | `False` | Skip scripts that need permissions beyond Reader (`Get-AzReservedInstances.ps1`) |
+| `-MaxParallel` | `3` | Maximum number of subscriptions to process concurrently in multi-subscription mode |
+| `-Sequential` | `False` | Disable cross-subscription parallelism and process subscriptions one at a time |
 
 > **Note**: `-SubscriptionId` and `-SubscriptionFile` are mutually exclusive. If neither is provided, the current `az` subscription is used.
 
@@ -83,19 +89,19 @@ See `subscriptions.example.txt` for a template.
 
 #### Multi-Subscription Output
 
-When using `-SubscriptionFile`, the report directory is organized per subscription with a cross-subscription summary:
+When using `-SubscriptionFile`, the report directory is organized per subscription with a cross-subscription summary. Multiple subscriptions run in parallel unless you pass `-Sequential`:
 
 ```
 reports/capacity-report-20260429-101347/
-├── cross-subscription-summary.md       # Aggregated view across all subscriptions
-├── production/                          # Per-subscription directory
+├── cross-subscription-summary.md                 # Aggregated view across all subscriptions
+├── production_12345678/                          # Per-subscription directory
 │   ├── service-inventory.json
 │   ├── region-capabilities.json
 │   ├── quota-usage.json
 │   ├── usage-trends.json
 │   ├── reserved-instances.json
 │   └── summary.md
-└── staging/
+└── staging_87654321/
     ├── ...
     └── summary.md
 ```
@@ -277,8 +283,10 @@ reports/capacity-report-20260429-101347/
 - **Multiple subscriptions**: List subscription IDs in a text file and run once:
   ```powershell
   pwsh Start-AzCapacityReport.ps1 -SubscriptionFile subscriptions.txt -OutputPath ./reports
+  pwsh Start-AzCapacityReport.ps1 -SubscriptionFile subscriptions.txt -OutputPath ./reports -MaxParallel 5
+  pwsh Start-AzCapacityReport.ps1 -SubscriptionFile subscriptions.txt -OutputPath ./reports -Sequential
   ```
-  This generates per-subscription reports plus a `cross-subscription-summary.md` with aggregated findings. See `subscriptions.example.txt` for the file format.
+  This generates per-subscription reports plus a `cross-subscription-summary.md` with aggregated findings. Use `-MaxParallel` to tune concurrency or `-Sequential` to disable parallel collection. See `subscriptions.example.txt` for the file format.
 - **Filtering**: Post-process the JSON files with PowerShell or `jq` for custom analysis:
   ```powershell
   # Find all quotas above 50% usage

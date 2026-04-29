@@ -9,18 +9,18 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Ensure resource-graph extension is available
+# Verify resource-graph extension is available
 $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'yes_without_prompt'
 try {
     $extList = (az extension list -o json 2>$null | ConvertFrom-Json)
-    $hasGraph = $extList | Where-Object { $_.name -eq 'resource-graph' }
-    if (-not $hasGraph) {
-        Write-Host "Installing Azure CLI resource-graph extension..." -ForegroundColor Yellow
-        az extension add --name resource-graph --only-show-errors
-    }
-} catch {
-    Write-Host "Installing Azure CLI resource-graph extension..." -ForegroundColor Yellow
-    az extension add --name resource-graph --only-show-errors
+}
+catch {
+    throw "Unable to verify Azure CLI extensions. $($_.Exception.Message)"
+}
+
+$hasGraph = @($extList | Where-Object { $_.name -eq 'resource-graph' }).Count -gt 0
+if (-not $hasGraph) {
+    throw "Azure CLI resource-graph extension is required. Run 'az extension add --name resource-graph' or use Start-AzCapacityReport.ps1."
 }
 
 function Invoke-AzCliJson {
@@ -250,8 +250,13 @@ foreach ($resourceType in $supportedMetricsByType.Keys) {
     $resourceTypesFound[$resourceType] = 0
 }
 
-$currentAccount = (Invoke-AzCliJson -Arguments @('account', 'show', '--output', 'json', '--only-show-errors')).Data
-$resolvedSubscriptionId = if ($SubscriptionId) { $SubscriptionId } else { [string]$currentAccount.id }
+$accountArgs = @('account', 'show', '--output', 'json', '--only-show-errors')
+if ($SubscriptionId) {
+    $accountArgs += @('--subscription', $SubscriptionId)
+}
+
+$currentAccount = (Invoke-AzCliJson -Arguments $accountArgs).Data
+$resolvedSubscriptionId = if ($currentAccount.id) { [string]$currentAccount.id } else { [string]$SubscriptionId }
 $resolvedSubscriptionName = if ($currentAccount.name) { [string]$currentAccount.name } else { $null }
 
 $periodEnd = (Get-Date).ToUniversalTime()

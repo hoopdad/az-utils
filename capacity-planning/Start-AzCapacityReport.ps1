@@ -14,7 +14,14 @@ param(
     [int]$DaysBack = 30,
 
     [Parameter()]
-    [switch]$SkipElevated
+    [switch]$SkipElevated,
+
+    [Parameter()]
+    [ValidateRange(1, 32)]
+    [int]$MaxParallel = 3,
+
+    [Parameter()]
+    [switch]$Sequential
 
 )
 
@@ -514,6 +521,252 @@ function Format-ResultSummary {
     return ($parts -join ', ')
 }
 
+function Resolve-CapacityScriptResult {
+    param(
+        [Parameter(Mandatory)]
+        [object]$ScriptRun,
+
+        [Parameter(Mandatory)]
+        [string]$ReportDir
+    )
+
+    $result = @{
+        Status           = 'success'
+        Duration         = if ($null -ne $ScriptRun.Duration) { [double]$ScriptRun.Duration } else { $null }
+        Error            = $null
+        Errors           = @()
+        Warnings         = @()
+        Note             = $null
+        Category         = [string]$ScriptRun.Category
+        RequiredRole     = [string]$ScriptRun.RequiredRole
+        RequiresElevated = [bool]$ScriptRun.Elevated
+        OutputLines      = @($ScriptRun.OutputLines)
+    }
+
+    switch ([string]$ScriptRun.ExecutionStatus) {
+        'missing' {
+            $result.Status = 'skipped'
+            $result.Error = 'Script not found'
+            $result.Errors = @('Script not found')
+            $result.Note = 'Script file is missing.'
+            return $result
+        }
+        'skipped' {
+            $result.Status = 'skipped'
+            $result.Duration = 0
+            $result.Note = [string]$ScriptRun.Note
+            return $result
+        }
+        'failed-invoke' {
+            $message = [string]$ScriptRun.InvocationError
+            $isPermission = Test-IsPermissionIssue -Message $message -ScriptDef $ScriptRun
+            $result.Status = if ($isPermission) { 'permission-failed' } else { 'failed' }
+            $result.Error = $message
+            $result.Errors = if ([string]::IsNullOrWhiteSpace($message)) { @() } else { @($message) }
+            $result.Note = if ($isPermission) {
+                "Insufficient permissions. Requires $($ScriptRun.RequiredRole)."
+            }
+            else {
+                $message
+            }
+            return $result
+        }
+    }
+
+    $outputFile = Join-Path $ReportDir ([string]$ScriptRun.Output)
+    if (-not (Test-Path -LiteralPath $outputFile)) {
+        $result.Status = 'failed'
+        $result.Error = 'Script completed without producing the expected output file.'
+        $result.Errors = @('Script completed without producing the expected output file.')
+        $result.Note = 'Script bug or unexpected early exit.'
+        return $result
+    }
+
+    try {
+        $data = Get-Content -LiteralPath $outputFile -Raw | ConvertFrom-Json -Depth 100
+    }
+    catch {
+        $message = "Failed to parse output file '$outputFile'. $($_.Exception.Message)"
+        $result.Status = 'failed'
+        $result.Error = $message
+        $result.Errors = @($message)
+        $result.Note = $message
+        return $result
+    }
+
+    Register-PiiFromProperties -InputObject $data
+
+    $metadata = Get-PropertyValue -InputObject $data -PropertyName 'metadata'
+    if ($null -ne $metadata) {
+        $metadataErrors = Get-PropertyValue -InputObject $metadata -PropertyName 'errors'
+        $metadataWarnings = Get-PropertyValue -InputObject $metadata -PropertyName 'warnings'
+        if ($null -ne $metadataErrors) {
+            $result.Errors = @($metadataErrors)
+        }
+        if ($null -ne $metadataWarnings) {
+            $result.Warnings = @($metadataWarnings)
+        }
+    }
+
+    $result['Data'] = $data
+
+    if (Test-IsPermissionIssue -Data $data -ScriptDef $ScriptRun) {
+        $result.Status = 'permission-failed'
+        $result.Note = Get-PermissionNote -Data $data -DefaultMessage "Insufficient permissions. Requires $($ScriptRun.RequiredRole)."
+    }
+    elseif ([string](Get-PropertyValue -InputObject $data -PropertyName 'status') -eq 'skipped') {
+        $result.Status = 'skipped'
+        $result.Note = [string](Get-PropertyValue -InputObject $data -PropertyName 'reason')
+        if ([string]::IsNullOrWhiteSpace([string]$result.Note)) {
+            $result.Note = 'Script reported a skip condition.'
+        }
+    }
+
+    return $result
+}
+
+function Write-CapturedOutput {
+    param(
+        [AllowNull()]
+        [string[]]$Lines
+    )
+
+    foreach ($entry in @($Lines)) {
+        foreach ($line in ([string]$entry -split "`r?`n")) {
+            if ([string]::IsNullOrEmpty($line)) {
+                Write-Log ''
+            }
+            else {
+                Write-Log "    $line" -ForegroundColor DarkGray
+            }
+        }
+    }
+}
+
+function Write-ScriptResultLog {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ScriptName,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Result
+    )
+
+    $durationText = if ($null -ne $Result.Duration) { " ($([math]::Round([double]$Result.Duration, 1))s)" } else { '' }
+    switch ([string]$Result.Status) {
+        'success' {
+            Write-Log "  [DONE] $ScriptName$durationText" -ForegroundColor Green
+        }
+        'permission-failed' {
+            Write-Log "  [PERMISSION] $ScriptName$durationText" -ForegroundColor Yellow
+            if (-not [string]::IsNullOrWhiteSpace([string]$Result.Note)) {
+                Write-Log "    Note: $($Result.Note)" -ForegroundColor Yellow
+            }
+        }
+        'failed' {
+            Write-Log "  [FAILED] $ScriptName$durationText" -ForegroundColor Red
+            if (-not [string]::IsNullOrWhiteSpace([string]$Result.Error)) {
+                Write-Log "    Error: $($Result.Error)" -ForegroundColor Red
+            }
+        }
+        'skipped' {
+            Write-Log "  [SKIP] $ScriptName$durationText" -ForegroundColor Yellow
+            if (-not [string]::IsNullOrWhiteSpace([string]$Result.Note)) {
+                Write-Log "    Note: $($Result.Note)" -ForegroundColor Yellow
+            }
+        }
+        default {
+            Write-Log "  [WARN] $ScriptName$durationText" -ForegroundColor Yellow
+        }
+    }
+
+    if ($Result.ContainsKey('OutputLines') -and @($Result.OutputLines).Count -gt 0) {
+        Write-CapturedOutput -Lines @($Result.OutputLines)
+    }
+}
+
+function Get-SubscriptionReportDirectoryName {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string]$SubscriptionName
+    )
+
+    $safeName = ($SubscriptionName -replace '[^\w\-]', '_').ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        $safeName = 'subscription'
+    }
+
+    $shortId = if ($SubscriptionId.Length -ge 8) { $SubscriptionId.Substring(0, 8) } else { $SubscriptionId }
+    return "${safeName}_${shortId}"
+}
+
+function Resolve-SubscriptionInfo {
+    param(
+        [AllowNull()]
+        [string]$RequestedSubscriptionId,
+
+        [AllowNull()]
+        [string]$FallbackName
+    )
+
+    $accountArgs = @('account', 'show', '--only-show-errors', '--output', 'json')
+    if (-not [string]::IsNullOrWhiteSpace($RequestedSubscriptionId)) {
+        $accountArgs += @('--subscription', $RequestedSubscriptionId)
+    }
+
+    $accountOutput = & az @accountArgs 2>&1
+    $exitCode = $LASTEXITCODE
+    $accountText = ($accountOutput | Out-String).Trim()
+
+    if ($exitCode -ne 0) {
+        if ([string]::IsNullOrWhiteSpace($accountText)) {
+            $accountText = 'Unable to resolve Azure subscription context.'
+        }
+
+        return [pscustomobject]@{
+            Success  = $false
+            Error    = $accountText
+            Id       = $RequestedSubscriptionId
+            Name     = $FallbackName
+            TenantId = $null
+        }
+    }
+
+    try {
+        $account = $accountText | ConvertFrom-Json -Depth 100
+    }
+    catch {
+        return [pscustomobject]@{
+            Success  = $false
+            Error    = "Failed to parse Azure CLI account output. $($_.Exception.Message)"
+            Id       = $RequestedSubscriptionId
+            Name     = $FallbackName
+            TenantId = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        Success  = $true
+        Error    = $null
+        Id       = [string]$account.id
+        Name     = if (-not [string]::IsNullOrWhiteSpace([string]$account.name)) { [string]$account.name } elseif (-not [string]::IsNullOrWhiteSpace($FallbackName)) { $FallbackName } else { [string]$RequestedSubscriptionId }
+        TenantId = [string]$account.tenantId
+    }
+}
+
+function Invoke-ExtensionPreflight {
+    Write-Log "Checking Azure CLI extensions..." -ForegroundColor Cyan
+    $extensions = az extension list -o json 2>$null | ConvertFrom-Json
+    $installedNames = @($extensions | ForEach-Object { $_.name })
+    if ('resource-graph' -notin $installedNames) {
+        Write-Log "  Installing resource-graph extension..." -ForegroundColor Yellow
+        az extension add --name resource-graph --only-show-errors 2>&1 | Out-Null
+    }
+}
+
 function Invoke-CapacityCollection {
     param(
         [string]$SubId,
@@ -535,43 +788,28 @@ function Invoke-CapacityCollection {
 
     foreach ($s in $scriptDefs) {
         $scriptPath = Join-Path $scriptDir $s.File
-        if (-not (Test-Path $scriptPath)) {
-            Write-Log "  [SKIP] $($s.Name) - script not found: $($s.File)" -ForegroundColor Yellow
-            $results[$s.Name] = @{
-                Status          = 'skipped'
-                Duration        = $null
-                Error           = 'Script not found'
-                Errors          = @()
-                Warnings        = @()
-                Note            = 'Script file is missing.'
-                Category        = $s.Category
-                RequiredRole    = $s.RequiredRole
-                RequiresElevated = $s.Elevated
-            }
-            continue
+        $scriptRun = [ordered]@{
+            Name            = $s.Name
+            Output          = $s.Output
+            Category        = $s.Category
+            RequiredRole    = $s.RequiredRole
+            Elevated        = $s.Elevated
+            Duration        = $null
+            ExecutionStatus = 'completed'
+            InvocationError = $null
+            OutputLines     = @()
+            Note            = $null
         }
 
-        if ($SkipElevated -and $s.Elevated) {
-            $note = "Skipped by -SkipElevated. Requires $($s.RequiredRole)."
-            Write-Log "  [SKIP] $($s.Name) - $note" -ForegroundColor Yellow
-            $results[$s.Name] = @{
-                Status           = 'skipped'
-                Duration         = 0
-                Error            = $null
-                Errors           = @()
-                Warnings         = @()
-                Note             = $note
-                Category         = $s.Category
-                RequiredRole     = $s.RequiredRole
-                RequiresElevated = $s.Elevated
-            }
-            continue
+        if (-not (Test-Path -LiteralPath $scriptPath)) {
+            $scriptRun.ExecutionStatus = 'missing'
         }
-
-        Write-Log "Running: $($s.Name)..." -ForegroundColor Cyan -NoNewline
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-
-        try {
+        elseif ($SkipElevated -and $s.Elevated) {
+            $scriptRun.ExecutionStatus = 'skipped'
+            $scriptRun.Note = "Skipped by -SkipElevated. Requires $($s.RequiredRole)."
+            $scriptRun.Duration = 0
+        }
+        else {
             $splatParams = @{
                 SubscriptionId = $SubId
                 OutputPath     = $ReportDir
@@ -580,103 +818,33 @@ function Invoke-CapacityCollection {
                 $splatParams['DaysBack'] = $DaysBack
             }
 
-            & $scriptPath @splatParams
-            $sw.Stop()
-
-            $outputFile = Join-Path $ReportDir $s.Output
-            if (-not (Test-Path $outputFile)) {
-                $results[$s.Name] = @{
-                    Status           = 'failed'
-                    Duration         = $sw.Elapsed.TotalSeconds
-                    Error            = 'Script completed without producing the expected output file.'
-                    Errors           = @('Script completed without producing the expected output file.')
-                    Warnings         = @()
-                    Note             = 'Script bug or unexpected early exit.'
-                    Category         = $s.Category
-                    RequiredRole     = $s.RequiredRole
-                    RequiresElevated = $s.Elevated
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $global:LASTEXITCODE = 0
+            try {
+                $scriptRun.OutputLines = @(& $scriptPath @splatParams *>&1 | ForEach-Object { $_.ToString() })
+                $exitCode = $LASTEXITCODE
+                if ($exitCode -ne 0) {
+                    $scriptRun.ExecutionStatus = 'failed-invoke'
+                    $message = "Script exited with code $exitCode."
+                    if (@($scriptRun.OutputLines).Count -gt 0) {
+                        $message = "$message $((@($scriptRun.OutputLines) -join [Environment]::NewLine).Trim())"
+                    }
+                    $scriptRun.InvocationError = $message.Trim()
                 }
-                Write-Log ' FAILED (no output file)' -ForegroundColor Red
-                continue
             }
-
-            $data = Get-Content $outputFile -Raw | ConvertFrom-Json -Depth 100
-            Register-PiiFromProperties -InputObject $data
-            $metadata = Get-PropertyValue -InputObject $data -PropertyName 'metadata'
-            $errs = @()
-            $warns = @()
-            if ($null -ne $metadata) {
-                $metadataErrors = Get-PropertyValue -InputObject $metadata -PropertyName 'errors'
-                $metadataWarnings = Get-PropertyValue -InputObject $metadata -PropertyName 'warnings'
-                if ($null -ne $metadataErrors) { $errs = @($metadataErrors) }
-                if ($null -ne $metadataWarnings) { $warns = @($metadataWarnings) }
+            catch {
+                $scriptRun.ExecutionStatus = 'failed-invoke'
+                $scriptRun.InvocationError = $_.Exception.Message
             }
-
-            $status = 'success'
-            $note = $null
-            if (Test-IsPermissionIssue -Data $data -ScriptDef $s) {
-                $status = 'permission-failed'
-                $note = Get-PermissionNote -Data $data -DefaultMessage "Insufficient permissions. Requires $($s.RequiredRole)."
-                Write-Log " permission issue ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
-            }
-            elseif ([string](Get-PropertyValue -InputObject $data -PropertyName 'status') -eq 'skipped') {
-                $status = 'skipped'
-                $note = [string](Get-PropertyValue -InputObject $data -PropertyName 'reason')
-                if ([string]::IsNullOrWhiteSpace($note)) {
-                    $note = 'Script reported a skip condition.'
-                }
-                Write-Log " skipped ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
-            }
-            else {
-                Write-Log " done ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Green
-            }
-
-            $results[$s.Name] = @{
-                Status           = $status
-                Duration         = $sw.Elapsed.TotalSeconds
-                Data             = $data
-                Error            = $null
-                Errors           = $errs
-                Warnings         = $warns
-                Note             = $note
-                Category         = $s.Category
-                RequiredRole     = $s.RequiredRole
-                RequiresElevated = $s.Elevated
+            finally {
+                $stopwatch.Stop()
+                $scriptRun.Duration = $stopwatch.Elapsed.TotalSeconds
             }
         }
-        catch {
-            $sw.Stop()
-            $message = $_.Exception.Message
-            $isPermission = Test-IsPermissionIssue -Message $message -ScriptDef $s
-            $status = if ($isPermission) { 'permission-failed' } else { 'failed' }
-            $note = if ($isPermission) {
-                "Insufficient permissions. Requires $($s.RequiredRole)."
-            }
-            else {
-                $message
-            }
 
-            $results[$s.Name] = @{
-                Status           = $status
-                Duration         = $sw.Elapsed.TotalSeconds
-                Error            = $message
-                Errors           = @($message)
-                Warnings         = @()
-                Note             = $note
-                Category         = $s.Category
-                RequiredRole     = $s.RequiredRole
-                RequiresElevated = $s.Elevated
-            }
-
-            if ($isPermission) {
-                Write-Log " PERMISSION ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Yellow
-                Write-Log "    Requires: $($s.RequiredRole)" -ForegroundColor Yellow
-            }
-            else {
-                Write-Log " FAILED ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Red
-                Write-Log "    Error: $message" -ForegroundColor Red
-            }
-        }
+        $result = Resolve-CapacityScriptResult -ScriptRun ([pscustomobject]$scriptRun) -ReportDir $ReportDir
+        $results[$s.Name] = $result
+        Write-ScriptResultLog -ScriptName $s.Name -Result $result
     }
 
     return $results
@@ -870,119 +1038,275 @@ Write-Log "`n========================================" -ForegroundColor Cyan
 Write-Log ' Azure Capacity Planning Report' -ForegroundColor Cyan
 Write-Log '========================================' -ForegroundColor Cyan
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$rootReportDir = Join-Path $OutputPath "capacity-report-$timestamp"
+New-Item -ItemType Directory -Path $rootReportDir -Force | Out-Null
 
-# Build list of subscriptions to process
-$subscriptions = @()
-
+$inputSubscriptions = @()
 if ($PSCmdlet.ParameterSetName -eq 'File') {
     $lines = Get-Content $SubscriptionFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') }
     foreach ($line in $lines) {
         $parts = $line -split '[,\t]', 2
         $id = $parts[0].Trim() -replace '#.*', '' | ForEach-Object { $_.Trim() }
-        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+        if ([string]::IsNullOrWhiteSpace($id)) {
+            continue
+        }
+
         $name = if ($parts.Count -gt 1 -and -not [string]::IsNullOrWhiteSpace($parts[1])) { ($parts[1].Trim() -replace '#.*', '').Trim() } else { '' }
-        $subscriptions += @{ Id = $id; Name = $name }
+        $inputSubscriptions += [pscustomobject]@{
+            Order        = $inputSubscriptions.Count
+            RequestedId  = $id
+            FallbackName = $name
+        }
     }
-    if ($subscriptions.Count -eq 0) {
+
+    if ($inputSubscriptions.Count -eq 0) {
         Add-LogEntry -Message "No valid subscription IDs found in '$SubscriptionFile'."
         Write-Error "No valid subscription IDs found in '$SubscriptionFile'."
         return
     }
-    Write-Log "`nLoaded $($subscriptions.Count) subscription(s) from: $SubscriptionFile" -ForegroundColor Green
+
+    Write-Log "`nLoaded $($inputSubscriptions.Count) subscription(s) from: $SubscriptionFile" -ForegroundColor Green
 }
 else {
-    if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
-        $accountJson = az account show -o json 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Add-LogEntry -Message "Not logged in to Azure CLI. Run 'az login' first."
-            Write-Error "Not logged in to Azure CLI. Run 'az login' first."
-            return
-        }
-        $account = $accountJson | ConvertFrom-Json
-        Register-Pii -Value $account.id -Category 'SubscriptionId' | Out-Null
-        Register-Pii -Value $account.name -Category 'SubscriptionName' | Out-Null
-        Register-Pii -Value $account.tenantId -Category 'TenantId' | Out-Null
-        $subscriptions += @{ Id = $account.id; Name = $account.name }
-    }
-    else {
-        $subscriptions += @{ Id = $SubscriptionId; Name = '' }
+    $inputSubscriptions += [pscustomobject]@{
+        Order        = 0
+        RequestedId  = $SubscriptionId
+        FallbackName = ''
     }
 }
 
-# Process each subscription
+$requestedSubscriptionCount = $inputSubscriptions.Count
 $allSubResults = @()
+$subscriptions = @()
 
-foreach ($sub in $subscriptions) {
-    $subId = $sub.Id
-    Register-Pii -Value $subId -Category 'SubscriptionId' | Out-Null
-    if (-not [string]::IsNullOrWhiteSpace([string]$sub.Name)) {
-        Register-Pii -Value $sub.Name -Category 'SubscriptionName' | Out-Null
-    }
-
-    az account set --subscription $subId 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Log "`n❌ Failed to set subscription: $subId" -ForegroundColor Red
-        $allSubResults += @{
-            Id     = $subId
-            Name   = $sub.Name
-            Status = 'failed'
-            Error  = 'Could not set subscription context'
+foreach ($entry in $inputSubscriptions) {
+    $lookup = Resolve-SubscriptionInfo -RequestedSubscriptionId $entry.RequestedId -FallbackName $entry.FallbackName
+    if (-not $lookup.Success) {
+        $displayName = if (-not [string]::IsNullOrWhiteSpace([string]$entry.FallbackName)) { $entry.FallbackName } elseif (-not [string]::IsNullOrWhiteSpace([string]$entry.RequestedId)) { $entry.RequestedId } else { 'current subscription' }
+        Write-Log "`n❌ Failed to resolve subscription: $displayName" -ForegroundColor Red
+        Write-Log "    Error: $($lookup.Error)" -ForegroundColor Red
+        $allSubResults += [pscustomobject]@{
+            Order                  = $entry.Order
+            Id                     = $entry.RequestedId
+            Name                   = $displayName
+            Status                 = 'failed'
+            Error                  = $lookup.Error
+            ReportDir              = $null
+            SummaryPath            = $null
+            Results                = @{}
+            SuccessCount           = 0
+            PermissionFailureCount = 0
+            ScriptFailureCount     = 1
+            SkipCount              = 0
+            Duration               = 0
         }
         continue
     }
 
-    $account = az account show -o json | ConvertFrom-Json
-    $subName = $account.name
-    Register-Pii -Value $subId -Category 'SubscriptionId' | Out-Null
-    Register-Pii -Value $subName -Category 'SubscriptionName' | Out-Null
-    Register-Pii -Value $account.tenantId -Category 'TenantId' | Out-Null
+    Register-Pii -Value $lookup.Id -Category 'SubscriptionId' | Out-Null
+    Register-Pii -Value $lookup.Name -Category 'SubscriptionName' | Out-Null
+    Register-Pii -Value $lookup.TenantId -Category 'TenantId' | Out-Null
 
-
-    if ($subscriptions.Count -gt 1) {
-        $safeName = ($subName -replace '[^\w\-]', '_').ToLower()
-        $subReportDir = Join-Path $OutputPath "capacity-report-$timestamp" $safeName
+    $subscriptions += [pscustomobject]@{
+        Order     = $entry.Order
+        Id        = $lookup.Id
+        Name      = $lookup.Name
+        TenantId  = $lookup.TenantId
+        ReportDir = if ($requestedSubscriptionCount -gt 1) { Join-Path $rootReportDir (Get-SubscriptionReportDirectoryName -SubscriptionId $lookup.Id -SubscriptionName $lookup.Name) } else { $rootReportDir }
     }
-    else {
-        $subReportDir = Join-Path $OutputPath "capacity-report-$timestamp"
-    }
-
-    Write-Log "`n----------------------------------------" -ForegroundColor DarkGray
-    Write-Log " [$($subscriptions.IndexOf($sub) + 1)/$($subscriptions.Count)] $subName" -ForegroundColor Cyan
-    Write-Log '----------------------------------------' -ForegroundColor DarkGray
-
-    $results = Invoke-CapacityCollection -SubId $subId -SubName $subName -ReportDir $subReportDir
-    $summaryPath = New-SubscriptionSummary -SubId $subId -SubName $subName -ReportDir $subReportDir -Results $results
-    $counts = Get-ResultCounts -Results $results
-
-    $allSubResults += @{
-        Id                     = $subId
-        Name                   = $subName
-        Status                 = 'completed'
-        ReportDir              = $subReportDir
-        SummaryPath            = $summaryPath
-        Results                = $results
-        SuccessCount           = $counts.Success
-        PermissionFailureCount = $counts.PermissionFailures
-        ScriptFailureCount     = $counts.ScriptFailures
-        SkipCount              = $counts.Skipped
-    }
-
-    $summaryText = Format-ResultSummary -Success $counts.Success -PermissionFailures $counts.PermissionFailures -ScriptFailures $counts.ScriptFailures -Skipped $counts.Skipped
-    $summaryColor = if ($counts.ScriptFailures -gt 0) { 'Yellow' } elseif ($counts.PermissionFailures -gt 0 -or $counts.Skipped -gt 0) { 'Yellow' } else { 'Green' }
-    Write-Log "`nScripts: $summaryText" -ForegroundColor $summaryColor
 }
 
-# Cross-subscription summary (when processing multiple subscriptions)
-if ($subscriptions.Count -gt 1) {
+if ($subscriptions.Count -gt 0) {
+    Invoke-ExtensionPreflight
+}
+
+if ($subscriptions.Count -eq 1 -or $Sequential -or $MaxParallel -le 1) {
+    if ($subscriptions.Count -gt 1) {
+        Write-Log "`nProcessing subscriptions sequentially..." -ForegroundColor Cyan
+    }
+
+    foreach ($sub in ($subscriptions | Sort-Object Order)) {
+        Write-Log "`n----------------------------------------" -ForegroundColor DarkGray
+        Write-Log " [$($sub.Order + 1)/$requestedSubscriptionCount] $($sub.Name)" -ForegroundColor Cyan
+        Write-Log '----------------------------------------' -ForegroundColor DarkGray
+
+        $subResults = Invoke-CapacityCollection -SubId $sub.Id -SubName $sub.Name -ReportDir $sub.ReportDir
+        $summaryPath = New-SubscriptionSummary -SubId $sub.Id -SubName $sub.Name -ReportDir $sub.ReportDir -Results $subResults
+        $counts = Get-ResultCounts -Results $subResults
+        $summaryText = Format-ResultSummary -Success $counts.Success -PermissionFailures $counts.PermissionFailures -ScriptFailures $counts.ScriptFailures -Skipped $counts.Skipped
+        $summaryColor = if ($counts.ScriptFailures -gt 0) { 'Yellow' } elseif ($counts.PermissionFailures -gt 0 -or $counts.Skipped -gt 0) { 'Yellow' } else { 'Green' }
+
+        Write-Log "`nScripts: $summaryText" -ForegroundColor $summaryColor
+
+        $allSubResults += [pscustomobject]@{
+            Order                  = $sub.Order
+            Id                     = $sub.Id
+            Name                   = $sub.Name
+            Status                 = 'completed'
+            ReportDir              = $sub.ReportDir
+            SummaryPath            = $summaryPath
+            Results                = $subResults
+            SuccessCount           = $counts.Success
+            PermissionFailureCount = $counts.PermissionFailures
+            ScriptFailureCount     = $counts.ScriptFailures
+            SkipCount              = $counts.Skipped
+            Duration               = 0
+        }
+    }
+}
+elseif ($subscriptions.Count -gt 1) {
+    Write-Log "`nProcessing subscriptions in parallel (MaxParallel=$MaxParallel)..." -ForegroundColor Cyan
+
+    $orderedSubscriptions = @($subscriptions | Sort-Object Order)
+    for ($i = 0; $i -lt $orderedSubscriptions.Count; $i += $MaxParallel) {
+        $batchEnd = [math]::Min($i + $MaxParallel - 1, $orderedSubscriptions.Count - 1)
+        $batch = @($orderedSubscriptions[$i..$batchEnd])
+
+        $batchResults = @($batch | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
+            Set-StrictMode -Version Latest
+            $ErrorActionPreference = 'Stop'
+
+            $sub = $_
+            New-Item -ItemType Directory -Path $sub.ReportDir -Force | Out-Null
+            $subscriptionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $scriptRuns = New-Object System.Collections.Generic.List[object]
+
+            foreach ($s in $using:scriptDefs) {
+                $scriptPath = Join-Path $using:scriptDir $s.File
+                $scriptRun = [pscustomobject]@{
+                    Name            = $s.Name
+                    Output          = $s.Output
+                    Category        = $s.Category
+                    RequiredRole    = $s.RequiredRole
+                    Elevated        = $s.Elevated
+                    Duration        = $null
+                    ExecutionStatus = 'completed'
+                    InvocationError = $null
+                    OutputLines     = @()
+                    Note            = $null
+                }
+
+                if (-not (Test-Path -LiteralPath $scriptPath)) {
+                    $scriptRun.ExecutionStatus = 'missing'
+                    $scriptRuns.Add($scriptRun) | Out-Null
+                    continue
+                }
+
+                if ($using:SkipElevated -and $s.Elevated) {
+                    $scriptRun.ExecutionStatus = 'skipped'
+                    $scriptRun.Duration = 0
+                    $scriptRun.Note = "Skipped by -SkipElevated. Requires $($s.RequiredRole)."
+                    $scriptRuns.Add($scriptRun) | Out-Null
+                    continue
+                }
+
+                $splatParams = @{
+                    SubscriptionId = $sub.Id
+                    OutputPath     = $sub.ReportDir
+                }
+                if ($s.Name -eq 'Usage Trends') {
+                    $splatParams['DaysBack'] = $using:DaysBack
+                }
+
+                $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $global:LASTEXITCODE = 0
+                try {
+                    $scriptRun.OutputLines = @(& $scriptPath @splatParams *>&1 | ForEach-Object { $_.ToString() })
+                    $exitCode = $LASTEXITCODE
+                    if ($exitCode -ne 0) {
+                        $scriptRun.ExecutionStatus = 'failed-invoke'
+                        $message = "Script exited with code $exitCode."
+                        if (@($scriptRun.OutputLines).Count -gt 0) {
+                            $message = "$message $((@($scriptRun.OutputLines) -join [Environment]::NewLine).Trim())"
+                        }
+                        $scriptRun.InvocationError = $message.Trim()
+                    }
+                }
+                catch {
+                    $scriptRun.ExecutionStatus = 'failed-invoke'
+                    $scriptRun.InvocationError = $_.Exception.Message
+                }
+                finally {
+                    $stopwatch.Stop()
+                    $scriptRun.Duration = $stopwatch.Elapsed.TotalSeconds
+                }
+
+                $scriptRuns.Add($scriptRun) | Out-Null
+            }
+
+            $subscriptionStopwatch.Stop()
+            [pscustomobject]@{
+                Order     = $sub.Order
+                Id        = $sub.Id
+                Name      = $sub.Name
+                TenantId  = $sub.TenantId
+                ReportDir = $sub.ReportDir
+                Duration  = $subscriptionStopwatch.Elapsed.TotalSeconds
+                ScriptRuns = @($scriptRuns)
+            }
+        })
+
+        foreach ($batchResult in ($batchResults | Sort-Object Order)) {
+            Register-Pii -Value $batchResult.Id -Category 'SubscriptionId' | Out-Null
+            Register-Pii -Value $batchResult.Name -Category 'SubscriptionName' | Out-Null
+            Register-Pii -Value $batchResult.TenantId -Category 'TenantId' | Out-Null
+
+            $subResults = @{}
+            foreach ($scriptRun in @($batchResult.ScriptRuns)) {
+                $resolvedResult = Resolve-CapacityScriptResult -ScriptRun $scriptRun -ReportDir $batchResult.ReportDir
+                $subResults[$scriptRun.Name] = $resolvedResult
+            }
+
+            $summaryPath = New-SubscriptionSummary -SubId $batchResult.Id -SubName $batchResult.Name -ReportDir $batchResult.ReportDir -Results $subResults
+            $counts = Get-ResultCounts -Results $subResults
+            $summaryText = Format-ResultSummary -Success $counts.Success -PermissionFailures $counts.PermissionFailures -ScriptFailures $counts.ScriptFailures -Skipped $counts.Skipped
+            $summaryColor = if ($counts.ScriptFailures -gt 0) { 'Yellow' } elseif ($counts.PermissionFailures -gt 0 -or $counts.Skipped -gt 0) { 'Yellow' } else { 'Green' }
+
+            Write-Log ("  [{0}/{1}] {2}... done ({3}s) - {4}" -f ($batchResult.Order + 1), $requestedSubscriptionCount, $batchResult.Name, [math]::Round([double]$batchResult.Duration, 1), $summaryText) -ForegroundColor $summaryColor
+            Write-Log "    Report directory: $($batchResult.ReportDir)"
+            if ($SkipElevated) {
+                Write-Log '    Elevated scripts: skipped by request (-SkipElevated)' -ForegroundColor Yellow
+            }
+
+            foreach ($s in $scriptDefs) {
+                $result = $subResults[$s.Name]
+                if ($null -ne $result) {
+                    Write-ScriptResultLog -ScriptName $s.Name -Result $result
+                }
+            }
+
+            $allSubResults += [pscustomobject]@{
+                Order                  = $batchResult.Order
+                Id                     = $batchResult.Id
+                Name                   = $batchResult.Name
+                Status                 = 'completed'
+                ReportDir              = $batchResult.ReportDir
+                SummaryPath            = $summaryPath
+                Results                = $subResults
+                SuccessCount           = $counts.Success
+                PermissionFailureCount = $counts.PermissionFailures
+                ScriptFailureCount     = $counts.ScriptFailures
+                SkipCount              = $counts.Skipped
+                Duration               = $batchResult.Duration
+            }
+        }
+    }
+}
+
+$allSubResults = @($allSubResults | Sort-Object Order)
+
+if ($requestedSubscriptionCount -gt 1) {
     $crossMd = [System.Text.StringBuilder]::new()
     [void]$crossMd.AppendLine('# Cross-Subscription Capacity Planning Report')
     [void]$crossMd.AppendLine('')
     [void]$crossMd.AppendLine('| Field | Value |')
     [void]$crossMd.AppendLine('|-------|-------|')
     [void]$crossMd.AppendLine("| **Generated** | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') |")
-    [void]$crossMd.AppendLine("| **Subscriptions** | $($subscriptions.Count) |")
+    [void]$crossMd.AppendLine("| **Subscriptions** | $requestedSubscriptionCount |")
     [void]$crossMd.AppendLine("| **Metrics Window** | $DaysBack days |")
     [void]$crossMd.AppendLine("| **Skip Elevated** | $(if ($SkipElevated) { 'Yes' } else { 'No' }) |")
+    [void]$crossMd.AppendLine("| **Sequential Mode** | $(if ($Sequential -or $MaxParallel -le 1) { 'Yes' } else { 'No' }) |")
+    [void]$crossMd.AppendLine("| **Max Parallel** | $MaxParallel |")
     [void]$crossMd.AppendLine('')
 
     [void]$crossMd.AppendLine('## Subscription Overview')
@@ -1076,40 +1400,33 @@ if ($subscriptions.Count -gt 1) {
     [void]$crossMd.AppendLine('')
     foreach ($subResult in $allSubResults) {
         if ($subResult.Status -eq 'completed') {
-            $relPath = [System.IO.Path]::GetFileName($subResult.ReportDir)
+            $relPath = [System.IO.Path]::GetRelativePath($rootReportDir, $subResult.ReportDir)
             [void]$crossMd.AppendLine("- **$($subResult.Name)**: [$relPath/summary.md]($relPath/summary.md)")
         }
     }
     [void]$crossMd.AppendLine('')
 
-    $crossSummaryDir = Join-Path $OutputPath "capacity-report-$timestamp"
-    New-Item -ItemType Directory -Path $crossSummaryDir -Force | Out-Null
-    $crossSummaryPath = Join-Path $crossSummaryDir 'cross-subscription-summary.md'
+    $crossSummaryPath = Join-Path $rootReportDir 'cross-subscription-summary.md'
     $crossMd.ToString() | Out-File -FilePath $crossSummaryPath -Encoding utf8
 }
 
-# Final output
 Write-Log "`n========================================" -ForegroundColor Cyan
 Write-Log ' Report Complete' -ForegroundColor Cyan
 Write-Log '========================================' -ForegroundColor Cyan
-
-$rootReportDir = Join-Path $OutputPath "capacity-report-$timestamp"
-New-Item -ItemType Directory -Path $rootReportDir -Force | Out-Null
 Write-Log "`nReport directory: $rootReportDir" -ForegroundColor Green
 
-if ($subscriptions.Count -gt 1) {
+if ($requestedSubscriptionCount -gt 1) {
     Write-Log "Cross-subscription summary: $(Join-Path $rootReportDir 'cross-subscription-summary.md')"
     $completedCount = @($allSubResults | Where-Object { $_.Status -eq 'completed' }).Count
     $failedCount = @($allSubResults | Where-Object { $_.Status -eq 'failed' }).Count
     Write-Log "`nSubscriptions: $completedCount completed, $failedCount failed" -ForegroundColor $(if ($failedCount -gt 0) { 'Yellow' } else { 'Green' })
 }
-else {
+elseif ($allSubResults.Count -gt 0 -and $allSubResults[0].Status -eq 'completed') {
     $r = $allSubResults[0]
     Write-Log "Summary: $($r.SummaryPath)"
     Write-Log "`nScripts: $(Format-ResultSummary -Success $r.SuccessCount -PermissionFailures $r.PermissionFailureCount -ScriptFailures $r.ScriptFailureCount -Skipped $r.SkipCount)" -ForegroundColor $(if ($r.ScriptFailureCount -gt 0) { 'Yellow' } elseif ($r.PermissionFailureCount -gt 0 -or $r.SkipCount -gt 0) { 'Yellow' } else { 'Green' })
 }
 
-# Generate Excel report
 $excelScript = Join-Path $scriptDir 'convert_to_excel.py'
 $excelOutput = Join-Path $rootReportDir 'capacity-report.xlsx'
 
@@ -1163,7 +1480,6 @@ else {
     Write-Log "`n⚠️  convert_to_excel.py not found - skipping Excel generation" -ForegroundColor Yellow
 }
 
-# Write obfuscated log
 $logPath = Join-Path $rootReportDir 'obfuscated-log.txt'
 $script:logBuilder.ToString() | Out-File -FilePath $logPath -Encoding utf8
 Write-Host "`nObfuscated log: $logPath" -ForegroundColor Green

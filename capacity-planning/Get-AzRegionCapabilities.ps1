@@ -181,16 +181,12 @@ function Get-ObjectPropertyValue {
     return $property.Value
 }
 
-$originalAccount = Invoke-AzCliJson -Step 'account-show-current' -Arguments @('account', 'show')
-$originalSubscriptionId = if ($null -ne $originalAccount) { [string]$originalAccount.id } else { $null }
-
-$subscription = if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
-    $originalAccount
-}
-else {
-    Invoke-AzCliJson -Step 'account-show' -Arguments @('account', 'show') -Subscription $SubscriptionId
+$subscriptionArgs = @('account', 'show')
+if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
+    $subscriptionArgs += @('--subscription', $SubscriptionId)
 }
 
+$subscription = Invoke-AzCliJson -Step 'account-show' -Arguments $subscriptionArgs
 $resolvedSubscriptionId = if ($null -ne $subscription) { [string]$subscription.id } else { $null }
 $resolvedSubscriptionName = if ($null -ne $subscription) { [string]$subscription.name } else { $null }
 
@@ -201,24 +197,15 @@ if ([string]::IsNullOrWhiteSpace($resolvedSubscriptionId)) {
 $regions = @()
 $vmSkusRaw = @()
 
-try {
-    if (-not [string]::IsNullOrWhiteSpace($resolvedSubscriptionId)) {
-        $null = Invoke-AzCli -Step 'account-set-target' -Arguments @('account', 'set', '--subscription', $resolvedSubscriptionId) -ExpectJson:$false
-
-        $regionData = Invoke-AzCliJson -Step 'list-locations' -Arguments @('account', 'list-locations')
-        if ($null -ne $regionData) {
-            $regions = @($regionData)
-        }
-
-        $vmSkuData = Invoke-AzCliJson -Step 'list-vm-skus' -Arguments @('vm', 'list-skus', '--resource-type', 'virtualMachines')
-        if ($null -ne $vmSkuData) {
-            $vmSkusRaw = @($vmSkuData)
-        }
+if (-not [string]::IsNullOrWhiteSpace($resolvedSubscriptionId)) {
+    $regionData = Invoke-AzCliJson -Step 'list-locations' -Arguments @('account', 'list-locations') -Subscription $resolvedSubscriptionId
+    if ($null -ne $regionData) {
+        $regions = @($regionData)
     }
-}
-finally {
-    if (-not [string]::IsNullOrWhiteSpace($originalSubscriptionId) -and $originalSubscriptionId -ne $resolvedSubscriptionId) {
-        $null = Invoke-AzCli -Step 'account-set-restore' -Arguments @('account', 'set', '--subscription', $originalSubscriptionId) -ExpectJson:$false
+
+    $vmSkuData = Invoke-AzCliJson -Step 'list-vm-skus' -Arguments @('vm', 'list-skus', '--resource-type', 'virtualMachines') -Subscription $resolvedSubscriptionId
+    if ($null -ne $vmSkuData) {
+        $vmSkusRaw = @($vmSkuData)
     }
 }
 
