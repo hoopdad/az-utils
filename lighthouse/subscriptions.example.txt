@@ -1,0 +1,6 @@
+# Azure Subscription IDs for Lighthouse onboarding
+# Format: SubscriptionId or SubscriptionId,DisplayName
+# Lines starting with # are ignored, blank lines are ignored
+
+aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,my-first-subscription
+ffffffff-1111-2222-3333-444444444444,my-second-subscription

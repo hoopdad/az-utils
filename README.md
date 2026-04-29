@@ -2,6 +2,19 @@
 
 Azure utility scripts for operational tasks.
 
+## Lighthouse Onboarding
+
+PowerShell script to onboard subscriptions for Azure Lighthouse — registers the `Microsoft.ManagedServices` resource provider and assigns Reader + Reservations Reader roles to specified users.
+
+See [`lighthouse/README.md`](lighthouse/README.md) for full documentation.
+
+**Quick start**:
+```powershell
+az login
+cd lighthouse
+pwsh Set-AzLighthouseOnboarding.ps1 -UsersFile users.txt
+```
+
 ## Capacity Planning
 
 PowerShell scripts to collect Azure subscription data — resource inventory, region capabilities, quotas, usage trends, and reservations — for capacity planning and region selection discussions.

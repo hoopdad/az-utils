@@ -1,0 +1,6 @@
+# User email addresses for Azure Lighthouse onboarding
+# Format: one email address per line
+# Lines starting with # are ignored, blank lines are ignored
+
+alice@contoso.com
+bob@contoso.com
