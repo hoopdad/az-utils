@@ -377,7 +377,7 @@ $payload = [pscustomobject][ordered]@{
 
 $payload | ConvertTo-Json -Depth 10 | Set-Content -Path $outputFile -Encoding utf8
 
-$resourceTypesWithResources = $supportedMetricsByType.Keys | Where-Object { $resourceTypesFound[$_] -gt 0 }
+$resourceTypesWithResources = @($supportedMetricsByType.Keys | Where-Object { $resourceTypesFound[$_] -gt 0 })
 $highUsageRecords = @(
     $records |
         Where-Object {
@@ -388,12 +388,17 @@ $highUsageRecords = @(
         Select-Object -First 10
 )
 
-Write-Host "Usage trends written to $outputFile"
-Write-Host "Resource types found: $(if ($resourceTypesWithResources.Count -gt 0) { $resourceTypesWithResources -join ', ' } else { 'none' })"
-Write-Host "Resources analyzed: $($discoveredResources.Count)"
-Write-Host "Metric summaries generated: $($records.Count)"
+$resourceTypeCount = @($resourceTypesWithResources).Count
+$resourcesAnalyzedCount = @($discoveredResources).Count
+$metricSummaryCount = @($records).Count
+$highUsageRecordCount = @($highUsageRecords).Count
 
-if ($highUsageRecords.Count -gt 0) {
+Write-Host "Usage trends written to $outputFile"
+Write-Host "Resource types found: $(if ($resourceTypeCount -gt 0) { $resourceTypesWithResources -join ', ' } else { 'none' })"
+Write-Host "Resources analyzed: $resourcesAnalyzedCount"
+Write-Host "Metric summaries generated: $metricSummaryCount"
+
+if ($highUsageRecordCount -gt 0) {
     Write-Host 'Notable high-usage resources:'
     foreach ($record in $highUsageRecords) {
         Write-Host (" - {0} [{1}] {2}: p95={3}, max={4}" -f $record.resourceName, $record.resourceType, $record.metricName, $record.p95, $record.maximum)
