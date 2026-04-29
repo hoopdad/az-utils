@@ -126,8 +126,15 @@ function Register-PiiFromProperties {
         [string]$TypeHint,
 
         [AllowNull()]
-        [string]$NameHint
+        [string]$NameHint,
+
+        [int]$Depth = 0
     )
+
+    # Limit recursion depth to avoid call stack overflow on deeply nested JSON
+    if ($Depth -gt 10) {
+        return
+    }
 
     if ($null -eq $InputObject) {
         return
@@ -146,7 +153,7 @@ function Register-PiiFromProperties {
 
     if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string]) -and -not ($InputObject -is [System.Collections.IDictionary])) {
         foreach ($item in $InputObject) {
-            Register-PiiFromProperties -InputObject $item
+            Register-PiiFromProperties -InputObject $item -Depth ($Depth + 1)
         }
         return
     }
@@ -227,7 +234,7 @@ function Register-PiiFromProperties {
             }
         }
 
-        Register-PiiFromProperties -InputObject $value
+        Register-PiiFromProperties -InputObject $value -Depth ($Depth + 1)
     }
 
     if (-not [string]::IsNullOrWhiteSpace($effectiveType) -and $effectiveType -match 'Microsoft\.Storage/storageAccounts' -and -not [string]::IsNullOrWhiteSpace($effectiveName)) {
@@ -594,7 +601,12 @@ function Resolve-CapacityScriptResult {
         return $result
     }
 
-    Register-PiiFromProperties -InputObject $data
+    try {
+        Register-PiiFromProperties -InputObject $data
+    }
+    catch {
+        # Non-fatal: PII obfuscation failure should not prevent report generation
+    }
 
     $metadata = Get-PropertyValue -InputObject $data -PropertyName 'metadata'
     if ($null -ne $metadata) {
