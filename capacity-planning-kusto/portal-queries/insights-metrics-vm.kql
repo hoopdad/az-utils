@@ -1,0 +1,12 @@
+// Run in: Azure Portal > Azure Monitor > Logs (or VM Insights workspace)
+// Requires: Azure Monitor Agent with VM Insights enabled
+InsightsMetrics
+| where TimeGenerated > ago(30d)
+| where Namespace == "Processor" and Name == "UtilizationPercentage"
+    or (Namespace == "Memory" and Name == "AvailableMB")
+| summarize
+    avg_value = avg(Val),
+    max_value = max(Val),
+    p95_value = percentile(Val, 95)
+    by Computer, Namespace, Name, bin(TimeGenerated, 1d)
+| order by Computer asc, Namespace asc, TimeGenerated asc

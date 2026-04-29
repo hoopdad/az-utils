@@ -1,0 +1,16 @@
+// Run in: Azure Portal > Resource Graph Explorer
+// NOTE: Actual reservation orders are NOT in Resource Graph.
+// This shows resources that are typically reservation candidates.
+Resources
+| where type in~ (
+    "microsoft.compute/virtualmachines",
+    "microsoft.sql/servers/databases",
+    "microsoft.dbformysql/flexibleservers",
+    "microsoft.dbforpostgresql/flexibleservers",
+    "microsoft.cache/redis",
+    "microsoft.kusto/clusters",
+    "microsoft.synapse/workspaces/sqlpools"
+)
+| extend skuName = tostring(sku.name), skuTier = tostring(sku.tier)
+| summarize count() by type, skuName, skuTier, location
+| order by type asc, count_ desc

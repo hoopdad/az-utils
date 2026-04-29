@@ -1,0 +1,12 @@
+// Run in: Azure Portal > Log Analytics workspace > Logs
+// Requires: Diagnostic settings sending App Service metrics to Log Analytics
+AzureMetrics
+| where TimeGenerated > ago(30d)
+| where ResourceProvider == "MICROSOFT.WEB"
+| where MetricName in ("CpuPercentage", "MemoryPercentage")
+| summarize
+    avg_value = avg(Average),
+    max_value = max(Maximum),
+    p95_value = percentile(Average, 95)
+    by Resource, MetricName, bin(TimeGenerated, 1d)
+| order by Resource asc, MetricName asc, TimeGenerated asc

@@ -1,0 +1,8 @@
+Resources
+| project name, type, location, resourceGroup,
+    skuName = tostring(sku.name),
+    skuTier = tostring(sku.tier),
+    skuSize = tostring(sku.size),
+    skuCapacity = tostring(sku.capacity),
+    tags
+| order by type asc, name asc

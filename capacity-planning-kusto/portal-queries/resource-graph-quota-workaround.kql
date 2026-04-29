@@ -1,0 +1,11 @@
+// Run in: Azure Portal > Resource Graph Explorer
+// NOTE: Actual quota limits/usage are NOT in Resource Graph.
+// This query shows resource concentration to identify regions
+// where you should manually check quotas.
+Resources
+| summarize
+    resourceCount = count(),
+    vmCount = countif(type =~ "microsoft.compute/virtualmachines"),
+    resourceTypes = dcount(type)
+    by location
+| order by vmCount desc, resourceCount desc

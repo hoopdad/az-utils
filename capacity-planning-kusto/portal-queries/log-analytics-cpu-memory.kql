@@ -1,0 +1,12 @@
+// Run in: Azure Portal > Log Analytics workspace > Logs
+// Requires: VMs sending data to this workspace (Azure Monitor Agent or Log Analytics Agent)
+Perf
+| where TimeGenerated > ago(30d)
+| where ObjectName == "Processor" and CounterName == "% Processor Time" and InstanceName == "_Total"
+    or (ObjectName == "Memory" and CounterName == "% Used Memory")
+| summarize
+    avg_value = avg(CounterValue),
+    max_value = max(CounterValue),
+    p95_value = percentile(CounterValue, 95)
+    by Computer, ObjectName, CounterName, bin(TimeGenerated, 1d)
+| order by Computer asc, ObjectName asc, TimeGenerated asc

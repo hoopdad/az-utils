@@ -1,0 +1,3 @@
+Resources
+| summarize count() by type
+| order by count_ desc

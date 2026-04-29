@@ -1,0 +1,10 @@
+Resources
+| extend skuName = tostring(sku.name), skuTier = tostring(sku.tier)
+| project name, type, location, resourceGroup,
+    sku = case(
+        isempty(skuName) and isempty(skuTier), '',
+        isempty(skuTier), skuName,
+        isempty(skuName), skuTier,
+        strcat(skuName, ' ', skuTier)
+    )
+| order by type asc, name asc

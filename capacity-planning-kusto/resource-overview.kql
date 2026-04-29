@@ -1,0 +1,6 @@
+Resources
+| summarize
+    totalResources = count(),
+    uniqueTypes = dcount(type),
+    uniqueRegions = dcount(location),
+    uniqueResourceGroups = dcount(resourceGroup)
