@@ -151,7 +151,9 @@ function Get-MetricStatistics {
     $peakSamples = New-Object 'System.Collections.Generic.List[double]'
 
     foreach ($timeSeries in @($MetricResult.timeseries)) {
+        if ($null -eq $timeSeries) { continue }
         foreach ($point in @($timeSeries.data)) {
+            if ($null -eq $point) { continue }
             $representativeValue = Get-FirstNumericValue -Point $point
 
             $averageProperty = $point.PSObject.Properties['average']
@@ -449,7 +451,7 @@ $highUsageRecords = @(
     $records |
         Where-Object {
             ($_.metricName -match 'percent|cpu|memory' -or $_.unit -match 'Percent') -and
-            (([double]$_.p95 -ge 80) -or ([double]$_.maximum -ge 90))
+            (($null -ne $_.p95 -and [double]$_.p95 -ge 80) -or ($null -ne $_.maximum -and [double]$_.maximum -ge 90))
         } |
         Sort-Object -Property p95, maximum -Descending |
         Select-Object -First 10
