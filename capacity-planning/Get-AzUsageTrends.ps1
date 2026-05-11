@@ -459,7 +459,7 @@ $highUsageRecords = @(
 
 $resourceTypeCount = @($resourceTypesWithResources).Count
 $resourcesAnalyzedCount = @($discoveredResources).Count
-$metricSummaryCount = @($records).Count
+$metricSummaryCount = $records.Count
 $highUsageRecordCount = @($highUsageRecords).Count
 
 Write-Host "Usage trends written to $outputFile"
