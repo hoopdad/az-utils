@@ -23,6 +23,11 @@ if (-not $hasGraph) {
     throw "Azure CLI resource-graph extension is required. Run 'az extension add --name resource-graph' or use Start-AzCapacityReport.ps1."
 }
 
+# Validate OutputPath early
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $OutputPath = (Get-Location).Path
+}
+
 function Invoke-AzCliJson {
     param(
         [Parameter(Mandatory)]
@@ -242,6 +247,8 @@ $supportedMetricsByType = [ordered]@{
     'Microsoft.Web/sites' = @('CpuPercentage', 'MemoryPercentage')
     'Microsoft.Sql/servers/databases' = @('cpu_percent', 'dtu_consumption_percent', 'storage_percent')
     'Microsoft.Storage/storageAccounts' = @('UsedCapacity')
+    'Microsoft.ContainerService/managedClusters' = @('node_cpu_usage_percentage', 'node_memory_rss_percentage')
+    'Microsoft.DBforPostgreSQL/flexibleServers' = @('cpu_percent', 'memory_percent', 'storage_percent', 'active_connections')
 }
 
 $canonicalTypesByLowerName = @{}
@@ -255,7 +262,46 @@ if ($SubscriptionId) {
     $accountArgs += @('--subscription', $SubscriptionId)
 }
 
-$currentAccount = (Invoke-AzCliJson -Arguments $accountArgs).Data
+$currentAccount = $null
+try {
+    $currentAccount = (Invoke-AzCliJson -Arguments $accountArgs).Data
+}
+catch {
+    $errors.Add("Failed to resolve subscription: $($_.Exception.Message)")
+}
+
+if ($null -eq $currentAccount) {
+    $errors.Add('Unable to resolve Azure subscription. Verify you are logged in with az login.')
+    # Write a failure envelope and exit gracefully
+    $failPayload = [pscustomobject][ordered]@{
+        metadata = [pscustomobject][ordered]@{
+            scriptName = $scriptName
+            subscriptionId = $SubscriptionId
+            subscriptionName = $null
+            collectedAt = (Get-Date).ToUniversalTime().ToString('o')
+            errors = @($errors)
+            warnings = @()
+        }
+        summary = [pscustomobject][ordered]@{
+            resourceTypesAnalyzed = @()
+            totalResourcesAnalyzed = 0
+            periodDays = $DaysBack
+            periodStart = $null
+            periodEnd = $null
+            coverageNotes = 'Script was unable to resolve subscription.'
+            resourcesByType = [pscustomobject]@{}
+        }
+        records = @()
+    }
+    if (-not (Test-Path -LiteralPath $OutputPath)) {
+        New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
+    }
+    $failFile = Join-Path -Path (Resolve-Path -LiteralPath $OutputPath).Path -ChildPath 'usage-trends.json'
+    $failPayload | ConvertTo-Json -Depth 10 | Set-Content -Path $failFile -Encoding utf8
+    Write-Warning "Usage trends written to $failFile (subscription resolution failed — see metadata.errors)."
+    return
+}
+
 $resolvedSubscriptionId = if ($currentAccount.id) { [string]$currentAccount.id } else { [string]$SubscriptionId }
 $resolvedSubscriptionName = if ($currentAccount.name) { [string]$currentAccount.name } else { $null }
 
@@ -267,20 +313,26 @@ $preferredInterval = if ($DaysBack -gt 14) { 'PT24H' } else { 'PT1H' }
 
 $graphQuery = @"
 Resources
-| where type in~ ('microsoft.compute/virtualmachines', 'microsoft.web/sites', 'microsoft.sql/servers/databases', 'microsoft.storage/storageaccounts')
+| where type in~ ('microsoft.compute/virtualmachines', 'microsoft.web/sites', 'microsoft.sql/servers/databases', 'microsoft.storage/storageaccounts', 'microsoft.containerservice/managedclusters', 'microsoft.dbforpostgresql/flexibleservers')
 | project id, name, type, location, resourceGroup
 | order by type asc, name asc
 "@
 
-$resourceDiscovery = (Invoke-AzCliJson -Arguments @(
+$resourceDiscoveryResult = Invoke-AzCliJson -Arguments @(
     'graph', 'query',
     '--subscriptions', $resolvedSubscriptionId,
     '--graph-query', $graphQuery,
     '--output', 'json',
     '--only-show-errors'
-)).Data
+) -AllowFailure
 
-$discoveredResources = @($resourceDiscovery.data)
+if (-not $resourceDiscoveryResult.Succeeded -or $null -eq $resourceDiscoveryResult.Data) {
+    $errMsg = if ($resourceDiscoveryResult.Error) { $resourceDiscoveryResult.Error } else { 'Resource Graph query returned no data.' }
+    Add-WarningNote -Warnings $warnings -Message "Resource discovery failed: $errMsg"
+}
+
+$resourceDiscovery = if ($resourceDiscoveryResult.Succeeded -and $null -ne $resourceDiscoveryResult.Data) { $resourceDiscoveryResult.Data } else { $null }
+$discoveredResources = if ($null -ne $resourceDiscovery -and $null -ne $resourceDiscovery.data) { @($resourceDiscovery.data) } else { @() }
 $resourcesByType = @{}
 foreach ($resourceType in $supportedMetricsByType.Keys) {
     $resourcesByType[$resourceType] = New-Object 'System.Collections.Generic.List[object]'
@@ -306,39 +358,49 @@ foreach ($resourceType in $supportedMetricsByType.Keys) {
 foreach ($resourceType in $supportedMetricsByType.Keys) {
     foreach ($resource in $resourcesByType[$resourceType]) {
         foreach ($metricName in $supportedMetricsByType[$resourceType]) {
-            $metricQuery = Invoke-MetricQuery -Subscription $resolvedSubscriptionId -ResourceId ([string]$resource.id) -MetricName $metricName -StartTime $periodStartText -EndTime $periodEndText -Interval $preferredInterval -Warnings $warnings
-            if (-not $metricQuery) {
-                continue
-            }
-
-            $intervalsUsed.Add($metricQuery.IntervalUsed) | Out-Null
-            $metricPayload = $metricQuery.Response
-            $metricValues = @($metricPayload.value)
-            if ($metricValues.Count -eq 0) {
-                Add-WarningNote -Warnings $warnings -Message "Metric '$metricName' returned no payload for resource '$($resource.id)'."
-                continue
-            }
-
-            foreach ($metricValue in $metricValues) {
-                $statistics = Get-MetricStatistics -MetricResult $metricValue -MetricName $metricName
-                if (-not $statistics) {
-                    Add-WarningNote -Warnings $warnings -Message "Metric '$metricName' returned no usable datapoints for resource '$($resource.id)'."
+            try {
+                $metricQuery = Invoke-MetricQuery -Subscription $resolvedSubscriptionId -ResourceId ([string]$resource.id) -MetricName $metricName -StartTime $periodStartText -EndTime $periodEndText -Interval $preferredInterval -Warnings $warnings
+                if (-not $metricQuery) {
                     continue
                 }
 
-                $records.Add([pscustomobject][ordered]@{
-                    resourceId = [string]$resource.id
-                    resourceName = [string]$resource.name
-                    resourceType = $resourceType
-                    location = [string]$resource.location
-                    resourceGroup = [string]$resource.resourceGroup
-                    metricName = if ($metricValue.name -and $metricValue.name.value) { [string]$metricValue.name.value } else { $statistics.MetricName }
-                    unit = if ($metricValue.unit) { [string]$metricValue.unit } else { 'Unknown' }
-                    average = if ($null -ne $statistics.Average) { [Math]::Round([double]$statistics.Average, 2) } else { $null }
-                    maximum = if ($null -ne $statistics.Maximum) { [Math]::Round([double]$statistics.Maximum, 2) } else { $null }
-                    p95 = if ($null -ne $statistics.P95) { [Math]::Round([double]$statistics.P95, 2) } else { $null }
-                    dataPointCount = [int]$statistics.DataPointCount
-                }) | Out-Null
+                $intervalsUsed.Add($metricQuery.IntervalUsed) | Out-Null
+                $metricPayload = $metricQuery.Response
+                if ($null -eq $metricPayload) {
+                    Add-WarningNote -Warnings $warnings -Message "Metric '$metricName' returned null response for resource '$($resource.name)'."
+                    continue
+                }
+
+                $metricValues = @($metricPayload.value)
+                if ($metricValues.Count -eq 0) {
+                    Add-WarningNote -Warnings $warnings -Message "Metric '$metricName' returned no payload for resource '$($resource.id)'."
+                    continue
+                }
+
+                foreach ($metricValue in $metricValues) {
+                    $statistics = Get-MetricStatistics -MetricResult $metricValue -MetricName $metricName
+                    if (-not $statistics) {
+                        Add-WarningNote -Warnings $warnings -Message "Metric '$metricName' returned no usable datapoints for resource '$($resource.id)'."
+                        continue
+                    }
+
+                    $records.Add([pscustomobject][ordered]@{
+                        resourceId = [string]$resource.id
+                        resourceName = [string]$resource.name
+                        resourceType = $resourceType
+                        location = [string]$resource.location
+                        resourceGroup = [string]$resource.resourceGroup
+                        metricName = if ($metricValue.name -and $metricValue.name.value) { [string]$metricValue.name.value } else { $statistics.MetricName }
+                        unit = if ($metricValue.unit) { [string]$metricValue.unit } else { 'Unknown' }
+                        average = if ($null -ne $statistics.Average) { [Math]::Round([double]$statistics.Average, 2) } else { $null }
+                        maximum = if ($null -ne $statistics.Maximum) { [Math]::Round([double]$statistics.Maximum, 2) } else { $null }
+                        p95 = if ($null -ne $statistics.P95) { [Math]::Round([double]$statistics.P95, 2) } else { $null }
+                        dataPointCount = [int]$statistics.DataPointCount
+                    }) | Out-Null
+                }
+            }
+            catch {
+                Add-WarningNote -Warnings $warnings -Message "Error collecting metric '$metricName' for '$($resource.name)': $($_.Exception.Message)"
             }
         }
     }
@@ -374,7 +436,7 @@ $payload = [pscustomobject][ordered]@{
         periodDays = $DaysBack
         periodStart = $periodStartText
         periodEnd = $periodEndText
-        coverageNotes = 'Metrics collected for VMs, App Services, SQL DBs, Storage Accounts'
+        coverageNotes = 'Metrics collected for VMs, App Services, SQL DBs, Storage Accounts, AKS Clusters, PostgreSQL Flexible Servers'
         resourcesByType = [pscustomobject]$resourceTypesFound
     }
     records = @($recordList)

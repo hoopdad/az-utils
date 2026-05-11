@@ -218,11 +218,16 @@ foreach ($region in $regions) {
 }
 
 foreach ($sku in $vmSkusRaw) {
-    $vCpus = Convert-ToNumberOrNull -Value (Get-CapabilityValue -Capabilities $sku.capabilities -Name 'vCPUs')
-    $memoryGb = Convert-ToNumberOrNull -Value (Get-CapabilityValue -Capabilities $sku.capabilities -Name 'MemoryGB')
-    $restrictions = @($sku.restrictions)
+    try {
+        $vCpus = Convert-ToNumberOrNull -Value (Get-CapabilityValue -Capabilities $sku.capabilities -Name 'vCPUs')
+        $memoryGb = Convert-ToNumberOrNull -Value (Get-CapabilityValue -Capabilities $sku.capabilities -Name 'MemoryGB')
+        $restrictions = @($sku.restrictions)
 
-    $locationEntries = [System.Collections.Generic.List[object]]::new()
+        if ([string]::IsNullOrWhiteSpace([string]$sku.name)) {
+            continue
+        }
+
+        $locationEntries = [System.Collections.Generic.List[object]]::new()
     foreach ($locationInfo in @($sku.locationInfo)) {
         if ([string]::IsNullOrWhiteSpace([string]$locationInfo.location)) {
             continue
@@ -269,6 +274,10 @@ foreach ($sku in $vmSkusRaw) {
         $null = $vmFamilySets[$regionName].Add([string]$sku.family)
         $totalVmSkuRecords++
     }
+    }
+    catch {
+        $metadataWarnings.Add("Skipped VM SKU '$($sku.name)': $($_.Exception.Message)")
+    }
 }
 
 $vmSkusByRegionOutput = [ordered]@{}
@@ -277,25 +286,30 @@ foreach ($regionName in ($vmSkusByRegion.Keys | Sort-Object)) {
 }
 
 $regionRecords = foreach ($region in ($regions | Sort-Object name)) {
-    $normalizedRegionName = ([string]$region.name).ToLowerInvariant()
-    $pairedRegion = $null
-    $pairedRegionEntries = Get-ObjectPropertyValue -InputObject (Get-ObjectPropertyValue -InputObject $region -PropertyName 'metadata') -PropertyName 'pairedRegion'
-    if ($null -ne $pairedRegionEntries) {
-        $pairedRegion = @($pairedRegionEntries | Select-Object -ExpandProperty name -First 1)
-    }
+    try {
+        $normalizedRegionName = ([string]$region.name).ToLowerInvariant()
+        $pairedRegion = $null
+        $pairedRegionEntries = Get-ObjectPropertyValue -InputObject (Get-ObjectPropertyValue -InputObject $region -PropertyName 'metadata') -PropertyName 'pairedRegion'
+        if ($null -ne $pairedRegionEntries) {
+            $pairedRegion = @($pairedRegionEntries | Select-Object -ExpandProperty name -First 1)
+        }
 
-    $availabilityZones = @()
-    $availabilityZoneMappings = Get-ObjectPropertyValue -InputObject $region -PropertyName 'availabilityZoneMappings'
-    if ($null -ne $availabilityZoneMappings) {
-        $availabilityZones = Get-NormalizedZones -Zones ($availabilityZoneMappings | Select-Object -ExpandProperty logicalZone)
-    }
+        $availabilityZones = @()
+        $availabilityZoneMappings = Get-ObjectPropertyValue -InputObject $region -PropertyName 'availabilityZoneMappings'
+        if ($null -ne $availabilityZoneMappings) {
+            $availabilityZones = Get-NormalizedZones -Zones ($availabilityZoneMappings | Select-Object -ExpandProperty logicalZone)
+        }
 
-    [ordered]@{
-        name                = $normalizedRegionName
-        displayName         = $region.displayName
-        pairedRegion        = if ($pairedRegion) { [string]$pairedRegion } else { $null }
-        availabilityZones   = $availabilityZones
-        vmFamiliesAvailable = if ($vmFamilySets.ContainsKey($normalizedRegionName)) { $vmFamilySets[$normalizedRegionName].Count } else { 0 }
+        [ordered]@{
+            name                = $normalizedRegionName
+            displayName         = $region.displayName
+            pairedRegion        = if ($pairedRegion) { [string]$pairedRegion } else { $null }
+            availabilityZones   = $availabilityZones
+            vmFamiliesAvailable = if ($vmFamilySets.ContainsKey($normalizedRegionName)) { $vmFamilySets[$normalizedRegionName].Count } else { 0 }
+        }
+    }
+    catch {
+        $metadataWarnings.Add("Skipped region '$($region.name)': $($_.Exception.Message)")
     }
 }
 

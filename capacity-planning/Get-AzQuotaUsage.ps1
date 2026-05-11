@@ -156,15 +156,21 @@ function Get-ComputeQuotaRecords {
     $records = New-Object System.Collections.Generic.List[object]
 
     foreach ($region in $Regions) {
-        $usageItems = Invoke-AzJson -Arguments @('vm', 'list-usage', '--location', $region, '--subscription', $EffectiveSubscriptionId, '--output', 'json', '--only-show-errors')
+        try {
+            $usageItems = Invoke-AzJson -Arguments @('vm', 'list-usage', '--location', $region, '--subscription', $EffectiveSubscriptionId, '--output', 'json', '--only-show-errors')
+            if ($null -eq $usageItems) { continue }
 
-        foreach ($item in $usageItems) {
-            $quotaName = if ($item.localName) { $item.localName } else { $item.name.localizedValue }
-            if ($quotaName -notmatch 'vCPUs') {
-                continue
+            foreach ($item in $usageItems) {
+                $quotaName = if ($item.localName) { $item.localName } else { $item.name.localizedValue }
+                if ($quotaName -notmatch 'vCPUs') {
+                    continue
+                }
+
+                $records.Add((New-QuotaRecord -Provider 'Compute' -Region $region -QuotaName $quotaName -Limit (Convert-ToNumber $item.limit) -CurrentUsage (Convert-ToNumber $item.currentValue) -Unit 'Count'))
             }
-
-            $records.Add((New-QuotaRecord -Provider 'Compute' -Region $region -QuotaName $quotaName -Limit (Convert-ToNumber $item.limit) -CurrentUsage (Convert-ToNumber $item.currentValue) -Unit 'Count'))
+        }
+        catch {
+            Write-Warning "Could not retrieve compute quotas for region '$region': $($_.Exception.Message)"
         }
     }
 
@@ -183,11 +189,17 @@ function Get-NetworkQuotaRecords {
     $records = New-Object System.Collections.Generic.List[object]
 
     foreach ($region in $Regions) {
-        $usageItems = Invoke-AzJson -Arguments @('network', 'list-usages', '--location', $region, '--subscription', $EffectiveSubscriptionId, '--output', 'json', '--only-show-errors')
+        try {
+            $usageItems = Invoke-AzJson -Arguments @('network', 'list-usages', '--location', $region, '--subscription', $EffectiveSubscriptionId, '--output', 'json', '--only-show-errors')
+            if ($null -eq $usageItems) { continue }
 
-        foreach ($item in $usageItems) {
-            $quotaName = if ($item.localName) { $item.localName } else { $item.name.localizedValue }
-            $records.Add((New-QuotaRecord -Provider 'Network' -Region $region -QuotaName $quotaName -Limit (Convert-ToNumber $item.limit) -CurrentUsage (Convert-ToNumber $item.currentValue) -Unit ([string]$item.unit)))
+            foreach ($item in $usageItems) {
+                $quotaName = if ($item.localName) { $item.localName } else { $item.name.localizedValue }
+                $records.Add((New-QuotaRecord -Provider 'Network' -Region $region -QuotaName $quotaName -Limit (Convert-ToNumber $item.limit) -CurrentUsage (Convert-ToNumber $item.currentValue) -Unit ([string]$item.unit)))
+            }
+        }
+        catch {
+            Write-Warning "Could not retrieve network quotas for region '$region': $($_.Exception.Message)"
         }
     }
 
@@ -213,17 +225,42 @@ if (-not (Test-Path -LiteralPath $resolvedOutputPath)) {
 }
 
 $account = Get-EffectiveSubscription -RequestedSubscriptionId $SubscriptionId
+if ($null -eq $account) {
+    Write-Error 'Unable to resolve the current Azure subscription. Verify you are logged in with az login.'
+    exit 1
+}
+
 $effectiveSubscriptionId = $account.id
-$regions = Get-ResourceRegions -EffectiveSubscriptionId $effectiveSubscriptionId
+if ([string]::IsNullOrWhiteSpace($effectiveSubscriptionId)) {
+    Write-Error 'Resolved subscription ID is empty. Verify your az login session.'
+    exit 1
+}
+
+$regions = @()
+try {
+    $regions = Get-ResourceRegions -EffectiveSubscriptionId $effectiveSubscriptionId
+}
+catch {
+    Write-Warning "Failed to discover resource regions: $($_.Exception.Message)"
+}
 
 if (-not $regions -or $regions.Count -eq 0) {
-    throw 'No Azure regions with resources were discovered for this subscription.'
+    Write-Warning 'No Azure regions with resources were discovered for this subscription. The report will contain no quota data.'
+    $regions = @()
 }
 
 $records = New-Object System.Collections.Generic.List[object]
-(Get-ComputeQuotaRecords -Regions $regions -EffectiveSubscriptionId $effectiveSubscriptionId) | ForEach-Object { $records.Add($_) }
-(Get-NetworkQuotaRecords -Regions $regions -EffectiveSubscriptionId $effectiveSubscriptionId) | ForEach-Object { $records.Add($_) }
-$records.Add((Get-StorageQuotaRecord -EffectiveSubscriptionId $effectiveSubscriptionId))
+if ($regions.Count -gt 0) {
+    (Get-ComputeQuotaRecords -Regions $regions -EffectiveSubscriptionId $effectiveSubscriptionId) | ForEach-Object { $records.Add($_) }
+    (Get-NetworkQuotaRecords -Regions $regions -EffectiveSubscriptionId $effectiveSubscriptionId) | ForEach-Object { $records.Add($_) }
+}
+
+try {
+    $records.Add((Get-StorageQuotaRecord -EffectiveSubscriptionId $effectiveSubscriptionId))
+}
+catch {
+    Write-Warning "Could not retrieve storage quota: $($_.Exception.Message)"
+}
 
 $allRecords = @($records.ToArray())
 $warningRecords = @($allRecords | Where-Object { $_.usagePercent -gt 80 })
