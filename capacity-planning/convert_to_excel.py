@@ -515,9 +515,15 @@ def main():
         for jf in json_files:
             key = jf.replace(".json", "")
             data[key] = load_json(os.path.join(sub_path, jf))
-        subs_data.append((sub_name, data))
+        # Resolve subscription name from JSON metadata when directory name isn't meaningful
+        resolved_name = sub_name
+        for v in data.values():
+            if v and isinstance(v, dict) and v.get("metadata", {}).get("subscriptionName"):
+                resolved_name = v["metadata"]["subscriptionName"]
+                break
+        subs_data.append((resolved_name, data))
         loaded = sum(1 for v in data.values() if v is not None)
-        print(f"  {sub_name}: {loaded}/{len(json_files)} files loaded")
+        print(f"  {resolved_name}: {loaded}/{len(json_files)} files loaded")
 
     # Build workbook
     print("\nBuilding Excel workbook...")
