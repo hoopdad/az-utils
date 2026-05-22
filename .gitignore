@@ -4,3 +4,7 @@ capacity-planning/sample-labl-subs.txt
 capacity-planning/sample-subscription.txt
 *-subs.txt
 capacity-planning/capacity-report*
+nva.csv
+capacity-planning/capacity-report*
+capacity-planning/report*
+*.csv
