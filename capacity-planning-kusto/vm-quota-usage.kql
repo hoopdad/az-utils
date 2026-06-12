@@ -1,0 +1,65 @@
+// Azure Resource Inventory + best-effort quota mapping
+// Source tables: resources, resourcecontainers, quotaresourcechanges
+//
+// NOTE:
+// quotaresourcechanges is a change-log table and field shape can vary by provider.
+// This query maps common patterns so quota columns populate when available.
+
+resources
+| where isnotempty(location)
+| extend location = tolower(location)
+| extend resourceKind = tostring(['kind'])
+| extend resourceProvider = tostring(split(type, '/')[0])
+| join kind=leftouter (
+    resourcecontainers
+    | where type =~ "microsoft.resources/subscriptions"
+    | project subscriptionId, subscriptionName = name
+) on subscriptionId
+| join kind=leftouter (
+    quotaresourcechanges
+    | where isnotempty(subscriptionId)
+    | where isnotempty(location)
+    | extend location = tolower(location)
+    | extend p = todynamic(properties)
+    | extend targetType = tostring(p['targetResourceType'])
+    | extend quotaEventTime = todatetime(p['changeAttributes']['timestamp'])
+    | extend changes = p['changes']
+    | where isnotempty(changes)
+    | mv-expand changePath = bag_keys(changes)
+    | extend changePath = tostring(changePath)
+    | where changePath startswith "properties.value["
+    | extend metricIndex = toint(extract(@"properties\.value\[(\d+)\]\.", 1, changePath))
+    | extend fieldName = extract(@"properties\.value\[\d+\]\.(.+)$", 1, changePath)
+    | extend changeObj = changes[changePath]
+    | extend newValue = tostring(changeObj['newValue'])
+    | summarize
+        quotaMetricLocalized = max(iif(fieldName == "name.localizedValue", newValue, "")),
+        quotaMetricName = max(iif(fieldName == "name.value", newValue, "")),
+        quotaUsed = max(todouble(iif(fieldName == "currentValue", newValue, ""))),
+        quotaLimit = max(todouble(iif(fieldName == "limit", newValue, ""))),
+        quotaEventTime = max(quotaEventTime)
+        by subscriptionId, location, targetType, metricIndex
+    | extend quotaMetric = iif(isnotempty(quotaMetricLocalized), quotaMetricLocalized,
+                        iif(isnotempty(quotaMetricName), quotaMetricName, targetType))
+    | where isnotempty(quotaMetric)
+    | extend resourceProvider = tostring(split(targetType, '/')[0])
+    | extend hasLimit = isnotempty(quotaLimit) and quotaLimit > 0
+    | extend ratio = iif(hasLimit, quotaUsed / quotaLimit, real(0))
+    | extend preferenceScore = iif(hasLimit, real(1000000) + ratio, coalesce(quotaUsed, real(-1)))
+    | summarize arg_max(preferenceScore, quotaMetric, quotaUsed, quotaLimit, quotaEventTime) by subscriptionId, location, resourceProvider
+) on subscriptionId, location, resourceProvider
+// Optional region filter: replace "" with e.g. "centralus" to filter to one region.
+| where "" == "" or location == tolower("")
+| project
+    subscriptionName = iif(isnotempty(subscriptionName), subscriptionName, subscriptionId),
+    name,
+    type,
+    location,
+    sku = tostring(sku.name),
+    tier = tostring(sku.tier),
+    resourceKind,
+    quotaLimit,
+    quotaUsed,
+    quotaMetric
+| order by subscriptionName asc, type asc, location asc, name asc
+

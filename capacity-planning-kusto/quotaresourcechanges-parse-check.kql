@@ -1,0 +1,35 @@
+// Diagnostic parser for quotaresourcechanges in this tenant
+// Purpose: parse indexed change paths like properties.value[62].currentValue
+
+quotaresourcechanges
+| where isnotempty(subscriptionId)
+| where isnotempty(location)
+| extend location = tolower(location)
+| extend p = todynamic(properties)
+| extend targetType = tostring(p['targetResourceType'])
+| extend eventTime = todatetime(p['changeAttributes']['timestamp'])
+| extend changes = p['changes']
+| where isnotempty(changes)
+| mv-expand changePath = bag_keys(changes)
+| extend changePath = tostring(changePath)
+| where changePath startswith "properties.value["
+| extend metricIndex = toint(extract(@"properties\.value\[(\d+)\]\.", 1, changePath))
+| extend fieldName = extract(@"properties\.value\[\d+\]\.(.+)$", 1, changePath)
+| extend changeObj = changes[changePath]
+| extend newValue = tostring(changeObj['newValue'])
+| summarize
+    quotaMetricLocalized = max(iif(fieldName == "name.localizedValue", newValue, "")),
+    quotaMetricName = max(iif(fieldName == "name.value", newValue, "")),
+    quotaUsed = max(todouble(iif(fieldName == "currentValue", newValue, ""))),
+    quotaLimit = max(todouble(iif(fieldName == "limit", newValue, ""))),
+    limitChangePath = max(iif(fieldName == "limit", changePath, "")),
+    currentChangePath = max(iif(fieldName == "currentValue", changePath, "")),
+    latestEvent = max(eventTime)
+    by subscriptionId, location, targetType, metricIndex
+| extend quotaMetric = iif(isnotempty(quotaMetricLocalized), quotaMetricLocalized,
+                    iif(isnotempty(quotaMetricName), quotaMetricName, targetType))
+| project subscriptionId, location, targetType, metricIndex, quotaMetric, quotaUsed, quotaLimit,
+    hasLimitChange = isnotempty(limitChangePath),
+    hasCurrentChange = isnotempty(currentChangePath),
+    latestEvent
+| take 100

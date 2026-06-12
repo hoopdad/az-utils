@@ -8,5 +8,6 @@ nva.csv
 capacity-planning/capacity-report*
 capacity-planning/report*
 quota-analysis/output/
-quota-analysis/*.xlsx
 *.csv
+*.zip
+*.xlsx

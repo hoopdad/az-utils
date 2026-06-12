@@ -1,0 +1,8 @@
+// Probe query: inspect quotaresourcechanges schema in your tenant
+// Run this first if quota columns are still empty.
+
+quotaresourcechanges
+| where isnotempty(subscriptionId)
+| where isnotempty(location)
+| project subscriptionId, location, type, id, properties
+| take 20
