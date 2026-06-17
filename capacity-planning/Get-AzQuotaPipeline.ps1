@@ -8,7 +8,11 @@
 
       Stage 1: Discover subscriptions         -> subscriptions.csv
       Stage 2: Discover active regions        -> subs_regions.csv
-      Stage 3: Collect compute/network quotas -> quota.csv
+      Stage 3: Collect quotas (all providers) -> quota.csv
+
+    Stage 3 covers Compute and Network via dedicated CLI commands, plus 19
+    additional Azure providers via the unified Quota API (az quota extension).
+    To add or remove providers, edit the $QuotaApiProviders table.
 
     Each stage can be skipped by providing its output file as input, enabling
     a "resume from where you left off" workflow. Parallelized by default.
@@ -95,6 +99,51 @@ function Resolve-QuotaName {
         }
     }
     return 'Unknown'
+}
+
+#endregion
+
+#region ── Provider Configuration ─────────────────────────────────────
+
+# Additional quota providers queried via the Azure Quota API (az quota list).
+# Compute and Network use dedicated CLI commands for richer data; everything
+# else goes through the unified Quota API with this table.
+# To add a provider: append @{ Label = 'Display Name'; Namespace = 'Microsoft.Provider' }
+$script:QuotaApiProviders = @(
+    @{ Label = 'Compute (classic)';          Namespace = 'Microsoft.ClassicCompute' }
+    @{ Label = 'Machine Learning';           Namespace = 'Microsoft.MachineLearningServices' }
+    @{ Label = 'Storage';                    Namespace = 'Microsoft.Storage' }
+    @{ Label = 'Storage (classic)';          Namespace = 'Microsoft.ClassicStorage' }
+    @{ Label = 'HPC Cache';                  Namespace = 'Microsoft.StorageCache' }
+    @{ Label = 'Azure HDInsight';            Namespace = 'Microsoft.HDInsight' }
+    @{ Label = 'Azure Lab Services';         Namespace = 'Microsoft.LabServices' }
+    @{ Label = 'Azure Container Instances';  Namespace = 'Microsoft.ContainerInstance' }
+    @{ Label = 'Dev Box';                    Namespace = 'Microsoft.DevCenter' }
+    @{ Label = 'Azure Container Apps';       Namespace = 'Microsoft.App' }
+    @{ Label = 'App Service';               Namespace = 'Microsoft.Web' }
+    @{ Label = 'Search';                     Namespace = 'Microsoft.Search' }
+    @{ Label = 'Azure VMware Solution';      Namespace = 'Microsoft.AVS' }
+    @{ Label = 'Managed DevOps Pools';       Namespace = 'Microsoft.DevOpsInfrastructure' }
+    @{ Label = 'Azure PostgreSQL';           Namespace = 'Microsoft.DBforPostgreSQL' }
+    @{ Label = 'Azure Database for MySQL';   Namespace = 'Microsoft.DBforMySQL' }
+    @{ Label = 'Automation Accounts';        Namespace = 'Microsoft.Automation' }
+    @{ Label = 'Microsoft Fabric';           Namespace = 'Microsoft.Fabric' }
+    @{ Label = 'Azure Kubernetes Service';   Namespace = 'Microsoft.ContainerService' }
+)
+
+function Resolve-QuotaApiItem {
+    param([Parameter(Mandatory)][object]$Item)
+
+    $props = $Item.properties
+    $n = Resolve-QuotaName -Item $props
+    if ($n -eq 'Unknown' -and $Item.name -is [string]) { $n = $Item.name }
+
+    $u = 0.0; $l = 0.0
+    if ($props.PSObject.Properties['usages'] -and $null -ne $props.usages -and $props.usages.PSObject.Properties['value']) { $u = [double]$props.usages.value }
+    if ($props.PSObject.Properties['limit']  -and $null -ne $props.limit  -and $props.limit.PSObject.Properties['value'])  { $l = [double]$props.limit.value }
+    $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
+
+    return @{ Name = $n; Used = $u; Limit = $l; Unit = $unit }
 }
 
 #endregion
@@ -196,7 +245,7 @@ function Get-QuotasForRegion {
         foreach ($item in @($items)) {
             if ($null -eq $item) { continue }
             $n = Resolve-QuotaName -Item $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (Get-UsagePercentValue $u $l) }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (Get-UsagePercentValue $u $l); IsQuotaApplicable = $true }
         }
     } catch { Write-Warning "Compute quota failed for $SubscriptionName / $Region : $_" }
 
@@ -207,9 +256,23 @@ function Get-QuotasForRegion {
             if ($null -eq $item) { continue }
             $n = Resolve-QuotaName -Item $item; $u = [double]$item.currentValue; $l = [double]$item.limit
             $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
-            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (Get-UsagePercentValue $u $l) }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (Get-UsagePercentValue $u $l); IsQuotaApplicable = $true }
         }
     } catch { Write-Warning "Network quota failed for $SubscriptionName / $Region : $_" }
+
+    # Additional providers via Azure Quota API
+    foreach ($provider in $script:QuotaApiProviders) {
+        try {
+            $scope = "subscriptions/$SubscriptionId/providers/$($provider.Namespace)/locations/$Region"
+            $items = Invoke-AzJsonSafe -Arguments @('quota', 'list', '--scope', $scope, '-o', 'json', '--only-show-errors')
+            foreach ($item in @($items)) {
+                if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
+                $q = Resolve-QuotaApiItem -Item $item
+                $applicable = if ($item.properties.PSObject.Properties['isQuotaApplicable']) { [bool]$item.properties.isQuotaApplicable } else { $true }
+                [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = $provider.Label; QuotaName = $q.Name; Used = $q.Used; Limit = $q.Limit; Unit = $q.Unit; UsagePercent = (Get-UsagePercentValue $q.Used $q.Limit); IsQuotaApplicable = $applicable }
+            }
+        } catch { Write-Warning "$($provider.Label) quota failed for $SubscriptionName / $Region : $_" }
+    }
 }
 
 function Get-AzPipelineQuotas {
@@ -231,6 +294,7 @@ function Get-AzPipelineQuotas {
     }
 
     Write-Host "  Collecting $total subscription-region combos ($ThrottleLimit parallel)..."
+    $quotaProviders = $script:QuotaApiProviders
     $results = $SubsRegions | ForEach-Object -Parallel {
         $subId = $_.SubscriptionId; $subName = $_.SubscriptionName; $region = $_.Region
 
@@ -250,7 +314,7 @@ function Get-AzPipelineQuotas {
             if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($json)) {
                 foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
                     $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (_Pct $u $l) }
+                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true }
                 }
             }
         } catch { Write-Warning "Compute quota failed for $subName / $region : $_" }
@@ -261,10 +325,31 @@ function Get-AzPipelineQuotas {
                 foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
                     $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
                     $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
-                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (_Pct $u $l) }
+                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true }
                 }
             }
         } catch { Write-Warning "Network quota failed for $subName / $region : $_" }
+
+        # Additional providers via Azure Quota API
+        foreach ($p in $using:quotaProviders) {
+            try {
+                $scope = "subscriptions/$subId/providers/$($p.Namespace)/locations/$region"
+                $json = (& az quota list --scope $scope -o json --only-show-errors 2>&1 | Out-String).Trim()
+                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($json)) { continue }
+                foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
+                    if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
+                    $props = $item.properties
+                    $applicable = if ($props.PSObject.Properties['isQuotaApplicable']) { [bool]$props.isQuotaApplicable } else { $true }
+                    $n = _Name $props
+                    if ($n -eq 'Unknown' -and $item.name -is [string]) { $n = $item.name }
+                    $u = 0.0; $l = 0.0
+                    if ($props.PSObject.Properties['usages'] -and $null -ne $props.usages -and $props.usages.PSObject.Properties['value']) { $u = [double]$props.usages.value }
+                    if ($props.PSObject.Properties['limit']  -and $null -ne $props.limit  -and $props.limit.PSObject.Properties['value'])  { $l = [double]$props.limit.value }
+                    $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
+                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = $p.Label; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $applicable }
+                }
+            } catch { Write-Warning "$($p.Label) quota failed for $subName / $region : $_" }
+        }
     } -ThrottleLimit $ThrottleLimit
 
     return @($results | Where-Object { $null -ne $_ })
