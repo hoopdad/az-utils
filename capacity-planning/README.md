@@ -56,6 +56,49 @@ All scripts require the built-in **Reader** role on each target subscription. Th
 
 ## Scripts
 
+### Get-AzQuotaPipeline.ps1 — Staged Quota Pipeline
+
+Fast, parallelized three-stage pipeline that collects Azure quota/usage data and outputs CSV files at each stage. Designed for users with many subscriptions who don't want to manually specify regions or SKU types.
+
+```powershell
+# Full pipeline for all enabled subscriptions (parallel by default)
+pwsh Get-AzQuotaPipeline.ps1 -AllEnabled
+
+# Single subscription
+pwsh Get-AzQuotaPipeline.ps1 -SubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Resume from stage 2 using previously-exported subscriptions.csv
+pwsh Get-AzQuotaPipeline.ps1 -SubscriptionsFile ./subscriptions.csv
+
+# Resume from stage 3 using previously-exported subs_regions.csv
+pwsh Get-AzQuotaPipeline.ps1 -SubsRegionsFile ./subs_regions.csv
+
+# High parallelism for large estates
+pwsh Get-AzQuotaPipeline.ps1 -AllEnabled -MaxParallel 16 -OutputDir ./reports
+```
+
+**Stages & Outputs:**
+
+| Stage | Action | Output CSV |
+|-------|--------|-----------|
+| 1 | Discover subscriptions | `subscriptions.csv` (SubscriptionId, SubscriptionName, TenantId) |
+| 2 | Discover active regions per sub | `subs_regions.csv` (SubscriptionId, SubscriptionName, Region, ResourceCount) |
+| 3 | Collect compute + network quotas | `quota.csv` (SubscriptionId, SubscriptionName, Region, Provider, QuotaName, Used, Limit, Unit, UsagePercent) |
+
+Provide a stage's output CSV as input to skip earlier stages. Edit the intermediate CSVs to filter subscriptions or regions before continuing.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-SubscriptionId` | Current subscription | Target a single subscription |
+| `-SubscriptionsFile` | — | Input CSV to skip stage 1 |
+| `-SubsRegionsFile` | — | Input CSV to skip stages 1+2 |
+| `-AllEnabled` | `False` | All enabled subscriptions in current tenant |
+| `-OutputDir` | Current directory | Directory for output CSVs |
+| `-MaxParallel` | `8` | Parallel threads for stages 2 and 3 |
+| `-Sequential` | `False` | Disable parallelism |
+
+---
+
 ### Export-AzCliResourceQuotaCsv.ps1 — Flat Quota Export
 
 Exports one flat CSV row per resource and attaches the best matching quota metric for that resource's provider and active region. The script supports three explicit subscription targeting modes and writes a companion active-region manifest CSV for traceability.
