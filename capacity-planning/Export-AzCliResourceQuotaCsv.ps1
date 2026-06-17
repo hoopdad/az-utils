@@ -1,9 +1,16 @@
-# Thanks Ravi for enhancing pagination and property handling to support large-scale resource inventories without data truncation.
+# run with:
+# pwsh Export-AzCliResourceQuotaCsv.ps1 -OutputCsvPath ./reports/resource-quota-usage.csv -AllEnabledSubscriptions
 
 [CmdletBinding()]
 param(
     [Parameter()]
     [string[]]$SubscriptionIds,
+
+    [Parameter()]
+    [string]$SubscriptionListPath = '',
+
+    [Parameter()]
+    [switch]$AllEnabledSubscriptions,
 
     [Parameter()]
     [string]$OutputCsvPath = (Join-Path -Path (Get-Location).Path -ChildPath ("resource-quota-usage-{0}.csv" -f (Get-Date -Format "yyyyMMdd-HHmmss"))),
@@ -12,7 +19,10 @@ param(
     [string]$RegionFilter = '',
 
     [Parameter()]
-    [string]$DiagnosticsCsvPath = ''
+    [string]$DiagnosticsCsvPath = '',
+
+    [Parameter()]
+    [string]$RegionManifestPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -20,7 +30,9 @@ $ErrorActionPreference = 'Stop'
 $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'yes_without_prompt'
 $script:ProviderUsageSpecCache = @{}
 $script:ProviderUnsupportedUsageCache = @{}
+$script:UsageApiVersionCache = @{}
 $script:QuotaDiagnostics = New-Object System.Collections.Generic.List[object]
+$script:SkippedSubscriptions = New-Object System.Collections.Generic.List[object]
 $script:MinimumVersions = @{
     PowerShell             = '5.1'
     AzureCli               = '2.40.0'
@@ -78,12 +90,19 @@ function Test-PreflightDependencies {
     }
 
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        $errors.Add('Azure CLI (az) is not installed or not on PATH.')
+        $errors.Add("Azure CLI (az) is not installed or not on PATH. Install it with 'winget install Microsoft.AzureCLI' (or your package manager), then run 'az login'.")
     }
     else {
+        $accountShowOutput = (& az account show --output json --only-show-errors 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) {
+            $errors.Add((
+                "Azure CLI is installed but not authenticated. Run 'az login' and ensure the target subscription is selected with 'az account set --subscription <subscriptionId>'. Details: {0}" -f $accountShowOutput
+            ))
+        }
+
         $azVersionRaw = (& az version --output json --only-show-errors 2>$null | Out-String).Trim()
         if ([string]::IsNullOrWhiteSpace($azVersionRaw)) {
-            $errors.Add('Unable to read Azure CLI version. Run `az version` to verify your install.')
+            $errors.Add("Unable to read Azure CLI version. Run 'az version' to verify your install.")
         }
         else {
             try {
@@ -92,15 +111,17 @@ function Test-PreflightDependencies {
                 $requiredAzCliVersion = [version]$script:MinimumVersions.AzureCli
 
                 if ($null -eq $azCliVersion) {
-                    $errors.Add('Unable to parse Azure CLI version from `az version`.')
+                    $errors.Add("Unable to parse Azure CLI version from 'az version'.")
                 }
                 elseif ($azCliVersion -lt $requiredAzCliVersion) {
-                    $errors.Add(("Azure CLI {0}+ is required. Current version: {1}." -f $requiredAzCliVersion, $azCliVersion))
+                    $errors.Add(("Azure CLI {0}+ is required. Current version: {1}. Upgrade with 'az upgrade'." -f $requiredAzCliVersion, $azCliVersion))
                 }
 
                 $extensionVersionValue = ''
-                if ($null -ne $azVersionData.extensions) {
-                    $extensionVersionValue = [string]$azVersionData.extensions.'resource-graph'
+                $extensionShowOutput = (& az extension show --name resource-graph --output json --only-show-errors 2>&1 | Out-String).Trim()
+                if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($extensionShowOutput)) {
+                    $extensionData = ConvertFrom-JsonCompat -JsonText $extensionShowOutput
+                    $extensionVersionValue = [string]$extensionData.version
                 }
 
                 if ([string]::IsNullOrWhiteSpace($extensionVersionValue)) {
@@ -129,8 +150,90 @@ function Test-PreflightDependencies {
     }
 
     if ($errors.Count -gt 0) {
-        throw ((@('Preflight dependency check failed:') + $errors) -join [Environment]::NewLine)
+        $message = @(
+            'Preflight dependency check failed. Resolve the following items:'
+            $errors
+            'After fixing, re-run the script.'
+        )
+        throw ($message -join [Environment]::NewLine)
     }
+}
+
+function Test-MinimumPermissions {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Subscriptions,
+
+        [Parameter()]
+        [switch]$SkipInaccessibleSubscriptions
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $accessibleSubscriptions = New-Object System.Collections.Generic.List[object]
+    $probeQuery = 'resources | take 1'
+
+    foreach ($sub in @($Subscriptions)) {
+        $subscriptionId = [string]$sub.id
+        $subscriptionName = [string]$sub.name
+
+        if ([string]::IsNullOrWhiteSpace($subscriptionId)) {
+            continue
+        }
+
+        $output = (& az graph query -q $probeQuery --subscriptions $subscriptionId --first 1 --output json --only-show-errors 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) {
+            $firstErrorLine = ''
+            foreach ($line in ($output -split "`r?`n")) {
+                $trimmed = [string]$line
+                if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+                    $firstErrorLine = $trimmed
+                    break
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($firstErrorLine)) {
+                $firstErrorLine = $output
+            }
+
+            if ($SkipInaccessibleSubscriptions) {
+                $script:SkippedSubscriptions.Add([pscustomobject]@{
+                    subscriptionId   = $subscriptionId
+                    subscriptionName = $subscriptionName
+                    reason           = $firstErrorLine
+                })
+                Write-Warning ((
+                    "Skipping subscription '{0}' ({1}) because az graph query failed. Reader is required. Details: {2}" -f $subscriptionName, $subscriptionId, $firstErrorLine
+                ))
+                continue
+            }
+
+            $errors.Add((
+                "Subscription '{0}' ({1}): minimum permission check failed for 'az graph query'. Required minimum access is built-in Reader on the subscription. Fix: ask a subscription owner to grant Reader, then run 'az login' and retry. Details: {2}" -f $subscriptionName, $subscriptionId, $firstErrorLine
+            ))
+            continue
+        }
+
+        $accessibleSubscriptions.Add($sub)
+    }
+
+    if ($errors.Count -gt 0) {
+        $message = @(
+            'Preflight permission check failed. The script requires Reader on every target subscription:'
+            $errors
+            "Tip: If your access was just granted, refresh your token with 'az login'."
+        )
+        throw ($message -join [Environment]::NewLine)
+    }
+
+    if ($accessibleSubscriptions.Count -eq 0) {
+        if ($SkipInaccessibleSubscriptions -and $script:SkippedSubscriptions.Count -gt 0) {
+            throw 'No accessible subscriptions remain after the permission check. Grant Reader on at least one target subscription or use a narrower subscription selection.'
+        }
+
+        throw 'No subscriptions passed the permission check.'
+    }
+
+    return $accessibleSubscriptions.ToArray()
 }
 
 function Add-QuotaDiagnostic {
@@ -259,29 +362,111 @@ function Invoke-AzJson {
 
 function Get-Subscriptions {
     param(
-        [string[]]$RequestedSubscriptionIds
+        [string[]]$RequestedSubscriptionIds,
+
+        [string]$SubscriptionListPath,
+
+        [switch]$AllEnabledSubscriptions
     )
 
+    $currentAccount = Invoke-AzJson -Arguments @('account', 'show', '--output', 'json', '--only-show-errors')
+    if ($null -eq $currentAccount -or [string]::IsNullOrWhiteSpace([string]$currentAccount.id)) {
+        throw 'Unable to determine the current Azure CLI subscription. Run az account show to verify your context.'
+    }
+
+    $currentTenantId = [string]$currentAccount.tenantId
     $accounts = @(Invoke-AzJson -Arguments @('account', 'list', '--all', '--output', 'json', '--only-show-errors'))
-    if ($RequestedSubscriptionIds -and $RequestedSubscriptionIds.Count -gt 0) {
+    $enabledAccounts = @($accounts | Where-Object { $_.state -eq 'Enabled' })
+    $enabledAccountsInCurrentTenant = @(
+        $enabledAccounts | Where-Object { [string]$_.tenantId -eq $currentTenantId }
+    )
+    $resolvedSubscriptionIds = New-Object System.Collections.Generic.List[string]
+
+    foreach ($sub in @($RequestedSubscriptionIds)) {
+        $trimmed = [string]$sub
+        if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+            $resolvedSubscriptionIds.Add($trimmed.Trim())
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SubscriptionListPath)) {
+        if (-not (Test-Path -LiteralPath $SubscriptionListPath)) {
+            throw "Subscription list file not found: $SubscriptionListPath"
+        }
+
+        foreach ($line in (Get-Content -LiteralPath $SubscriptionListPath)) {
+            $trimmed = ([string]$line).Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) {
+                continue
+            }
+
+            $candidate = (($trimmed -split ',', 2)[0]).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                $resolvedSubscriptionIds.Add($candidate)
+            }
+        }
+    }
+
+    if ($resolvedSubscriptionIds.Count -gt 0) {
         $lookup = @{}
-        foreach ($sub in $RequestedSubscriptionIds) {
+        foreach ($sub in @($resolvedSubscriptionIds)) {
             $lookup[$sub.ToLowerInvariant()] = $true
         }
 
-        return @(
-            $accounts | Where-Object {
+        $matchedSubscriptions = @(
+            $enabledAccounts | Where-Object {
                 $id = [string]$_.id
                 $name = [string]$_.name
                 $lookup.ContainsKey($id.ToLowerInvariant()) -or $lookup.ContainsKey($name.ToLowerInvariant())
             }
         )
+
+        $matchedLookup = @{}
+        foreach ($match in $matchedSubscriptions) {
+            $matchedLookup[[string]$match.id.ToLowerInvariant()] = $true
+            $matchedLookup[[string]$match.name.ToLowerInvariant()] = $true
+        }
+
+        $unmatched = @(
+            $resolvedSubscriptionIds |
+                Where-Object { -not $matchedLookup.ContainsKey(([string]$_).ToLowerInvariant()) } |
+                Select-Object -Unique
+        )
+
+        if ($unmatched.Count -gt 0) {
+            throw ((
+                "The following subscriptions were not found among enabled subscriptions visible to the current Azure CLI context: {0}" -f ($unmatched -join ', ')
+            ))
+        }
+
+        return $matchedSubscriptions
     }
 
-    return @($accounts | Where-Object { $_.state -eq 'Enabled' })
+    if ($AllEnabledSubscriptions) {
+        return $enabledAccountsInCurrentTenant
+    }
+
+    return @(
+        $enabledAccountsInCurrentTenant | Where-Object { [string]$_.id -eq [string]$currentAccount.id }
+    )
 }
 
 Test-PreflightDependencies
+
+$subscriptionTargetingModeCount = 0
+if ($SubscriptionIds -and $SubscriptionIds.Count -gt 0) {
+    $subscriptionTargetingModeCount++
+}
+if (-not [string]::IsNullOrWhiteSpace($SubscriptionListPath)) {
+    $subscriptionTargetingModeCount++
+}
+if ($AllEnabledSubscriptions) {
+    $subscriptionTargetingModeCount++
+}
+
+if ($subscriptionTargetingModeCount -gt 1) {
+    throw 'Choose only one subscription targeting mode: -SubscriptionIds, -SubscriptionListPath, or -AllEnabledSubscriptions.'
+}
 
 function Get-ResourcesForSubscription {
     param(
@@ -363,6 +548,51 @@ function Get-ObjectStringProperty {
     }
 
     return [string]$prop.Value
+}
+
+function Get-ActiveRegionRecords {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Resources
+    )
+
+    return @(
+        $Resources |
+            ForEach-Object {
+                $location = (Get-ObjectStringProperty -Object $_ -PropertyName 'location').ToLowerInvariant()
+                if ([string]::IsNullOrWhiteSpace($location)) {
+                    return
+                }
+
+                [pscustomobject]@{
+                    location = $location
+                }
+            } |
+            Group-Object -Property location |
+            Sort-Object -Property Name |
+            ForEach-Object {
+                [pscustomobject]@{
+                    activeRegion  = [string]$_.Name
+                    resourceCount = [int]$_.Count
+                }
+            }
+    )
+}
+
+function Get-PercentText {
+    param(
+        [Parameter(Mandatory)]
+        [double]$Numerator,
+
+        [Parameter(Mandatory)]
+        [double]$Denominator
+    )
+
+    if ($Denominator -le 0) {
+        return '0%'
+    }
+
+    return ('{0}%' -f [math]::Round(($Numerator / $Denominator) * 100, 1))
 }
 
 function Get-ResourceProviderFromRow {
@@ -508,7 +738,16 @@ function Get-UsagePayload {
     }
 
     foreach ($spec in $specs) {
-        foreach ($apiVersion in @($spec.ApiVersions)) {
+        $versionsToTry = @($spec.ApiVersions)
+        $usageCacheKey = ("{0}|{1}" -f $Provider.ToLowerInvariant(), [string]$spec.PathTemplate)
+        if ($script:UsageApiVersionCache.ContainsKey($usageCacheKey)) {
+            $cachedVersion = [string]$script:UsageApiVersionCache[$usageCacheKey]
+            if (-not [string]::IsNullOrWhiteSpace($cachedVersion) -and $versionsToTry -contains $cachedVersion) {
+                $versionsToTry = @($cachedVersion) + @($versionsToTry | Where-Object { $_ -ne $cachedVersion })
+            }
+        }
+
+        foreach ($apiVersion in $versionsToTry) {
             $path = [string]$spec.PathTemplate
             $path = $path.Replace('{subscriptionId}', $SubscriptionId)
             $path = $path.Replace('{provider}', $Provider)
@@ -525,6 +764,7 @@ function Get-UsagePayload {
             ) -AllowFailure -FailureMessageRef ([ref]$failureMessage)
 
             if ($null -ne $response -and $null -ne $response.value) {
+                $script:UsageApiVersionCache[$usageCacheKey] = $apiVersion
                 return $response
             }
 
@@ -643,7 +883,13 @@ function Get-QuotaMap {
         [string]$SubscriptionName,
 
         [Parameter(Mandatory)]
-        [object[]]$Resources
+        [object[]]$Resources,
+
+        [Parameter(Mandatory)]
+        [int]$SubscriptionOrdinal,
+
+        [Parameter(Mandatory)]
+        [int]$SubscriptionCount
     )
 
     $map = @{}
@@ -670,6 +916,24 @@ function Get-QuotaMap {
             ForEach-Object { $_.Name }
     )
 
+    $regionNames = @(
+        $normalizedRows |
+            Group-Object -Property location |
+            Sort-Object -Property Name |
+            ForEach-Object { [string]$_.Name }
+    )
+
+    $regionIndexByLocation = @{}
+    for ($i = 0; $i -lt $regionNames.Count; $i++) {
+        $regionIndexByLocation[$regionNames[$i]] = $i + 1
+    }
+
+    $announcedRegions = @{}
+    $totalWorkItems = $keys.Count
+    $processedWorkItems = 0
+    $heartbeatInterval = 25
+    $startTime = Get-Date
+
     foreach ($key in $keys) {
         $parts = $key.Split('|', 2)
         $provider = $parts[0]
@@ -677,6 +941,41 @@ function Get-QuotaMap {
 
         if ([string]::IsNullOrWhiteSpace($provider) -or [string]::IsNullOrWhiteSpace($location)) {
             continue
+        }
+
+        if (-not $announcedRegions.ContainsKey($location)) {
+            $announcedRegions[$location] = $true
+            $regionOrdinal = 0
+            if ($regionIndexByLocation.ContainsKey($location)) {
+                $regionOrdinal = [int]$regionIndexByLocation[$location]
+            }
+
+            $subscriptionPercent = Get-PercentText -Numerator $SubscriptionOrdinal -Denominator $SubscriptionCount
+            $regionPercent = Get-PercentText -Numerator $regionOrdinal -Denominator $regionNames.Count
+            Write-Host ((
+                "Working on {0} in {1} (subscription {2}/{3}, {4}; region {5}/{6}, {7})" -f
+                $SubscriptionName,
+                $location,
+                $SubscriptionOrdinal,
+                $SubscriptionCount,
+                $subscriptionPercent,
+                $regionOrdinal,
+                $regionNames.Count,
+                $regionPercent
+            ))
+        }
+
+        $processedWorkItems++
+        $percentComplete = 0
+        if ($totalWorkItems -gt 0) {
+            $percentComplete = [math]::Min(100, [math]::Floor(($processedWorkItems * 100.0) / $totalWorkItems))
+        }
+
+        Write-Progress -Id 1 -Activity ("Quota collection in {0}" -f $SubscriptionName) -Status ("{0}/{1} provider-region combinations ({2})" -f $processedWorkItems, $totalWorkItems, $location) -PercentComplete $percentComplete
+
+        if (($processedWorkItems % $heartbeatInterval) -eq 0 -or $processedWorkItems -eq 1) {
+            $elapsed = (Get-Date) - $startTime
+            Write-Host ("Still working in {0}: {1}/{2} combinations processed ({3} elapsed)." -f $SubscriptionName, $processedWorkItems, $totalWorkItems, $elapsed.ToString('hh\:mm\:ss'))
         }
 
         if ($script:ProviderUnsupportedUsageCache.ContainsKey($provider)) {
@@ -705,17 +1004,58 @@ function Get-QuotaMap {
         $map["$provider|$location"] = $best
     }
 
+    Write-Progress -Id 1 -Activity ("Quota collection in {0}" -f $SubscriptionName) -Completed
+
     return $map
 }
 
-$subscriptions = Get-Subscriptions -RequestedSubscriptionIds $SubscriptionIds
+$subscriptions = Get-Subscriptions -RequestedSubscriptionIds $SubscriptionIds -SubscriptionListPath $SubscriptionListPath -AllEnabledSubscriptions:$AllEnabledSubscriptions
 if (-not $subscriptions -or $subscriptions.Count -eq 0) {
-    throw 'No subscriptions matched. Use az login and verify the provided -SubscriptionIds values.'
+    throw 'No subscriptions matched. Use az login and verify the selected subscription targeting mode.'
 }
 
+$targetTenantId = ''
+$targetTenantName = ''
+if ($subscriptions.Count -gt 0) {
+    $targetTenantId = [string]$subscriptions[0].tenantId
+    $targetTenantName = [string]$subscriptions[0].tenantDisplayName
+}
+
+if (-not [string]::IsNullOrWhiteSpace($targetTenantId)) {
+    if ([string]::IsNullOrWhiteSpace($targetTenantName)) {
+        Write-Host ("Target tenant: {0}" -f $targetTenantId)
+    }
+    else {
+        Write-Host ("Target tenant: {0} ({1})" -f $targetTenantName, $targetTenantId)
+    }
+}
+
+$skipInaccessibleSubscriptions = $false
+if ($AllEnabledSubscriptions -and -not ($SubscriptionIds -and $SubscriptionIds.Count -gt 0) -and [string]::IsNullOrWhiteSpace($SubscriptionListPath)) {
+    $skipInaccessibleSubscriptions = $true
+}
+
+if ($skipInaccessibleSubscriptions) {
+    Write-Host 'Skipping upfront per-subscription permission probe for all-enabled mode. Inaccessible subscriptions will be skipped lazily during collection.'
+}
+else {
+    $subscriptions = @(Test-MinimumPermissions -Subscriptions $subscriptions -SkipInaccessibleSubscriptions:$skipInaccessibleSubscriptions)
+}
+
+if ($script:SkippedSubscriptions.Count -gt 0) {
+    Write-Warning ("Skipping {0} inaccessible subscriptions and continuing with {1} accessible subscriptions." -f $script:SkippedSubscriptions.Count, $subscriptions.Count)
+}
+
+$runStartTime = Get-Date
 $allRows = New-Object System.Collections.Generic.List[object]
+$regionManifestRows = New-Object System.Collections.Generic.List[object]
+$subscriptionSummaries = New-Object System.Collections.Generic.List[object]
+$subscriptionCount = $subscriptions.Count
+$subscriptionOrdinal = 0
 
 foreach ($sub in $subscriptions) {
+    $subscriptionStartTime = Get-Date
+    $subscriptionOrdinal++
     $subscriptionId = [string]$sub.id
     $subscriptionName = [string]$sub.name
 
@@ -723,15 +1063,82 @@ foreach ($sub in $subscriptions) {
         continue
     }
 
-    Write-Host ("Collecting resources for {0} ({1})..." -f $subscriptionName, $subscriptionId)
-    $resources = Get-ResourcesForSubscription -SubscriptionId $subscriptionId -RegionFilter $RegionFilter
+    $subscriptionPercent = Get-PercentText -Numerator $subscriptionOrdinal -Denominator $subscriptionCount
+    Write-Host ("Collecting resources for {0} ({1}) - subscription {2}/{3} ({4})..." -f $subscriptionName, $subscriptionId, $subscriptionOrdinal, $subscriptionCount, $subscriptionPercent)
+
+    try {
+        $resources = Get-ResourcesForSubscription -SubscriptionId $subscriptionId -RegionFilter $RegionFilter
+    }
+    catch {
+        if ($skipInaccessibleSubscriptions) {
+            $reason = $_.Exception.Message
+            if ([string]::IsNullOrWhiteSpace($reason)) {
+                $reason = 'Unknown error while collecting resources.'
+            }
+
+            $script:SkippedSubscriptions.Add([pscustomobject]@{
+                subscriptionId   = $subscriptionId
+                subscriptionName = $subscriptionName
+                reason           = $reason
+            })
+
+            Write-Warning ("Skipping subscription '{0}' ({1}) due to resource discovery failure. Details: {2}" -f $subscriptionName, $subscriptionId, $reason)
+
+            $subscriptionElapsed = (Get-Date) - $subscriptionStartTime
+            $subscriptionSummaries.Add([pscustomobject]@{
+                subscriptionId        = $subscriptionId
+                subscriptionName      = $subscriptionName
+                status                = 'Skipped'
+                activeRegionCount     = 0
+                resourceCount         = 0
+                quotaDiagnosticCount  = 0
+                elapsed               = $subscriptionElapsed.ToString('hh\:mm\:ss')
+            })
+            continue
+        }
+
+        throw
+    }
+
     if (-not $resources -or $resources.Count -eq 0) {
+        $regionManifestRows.Add([pscustomobject]@{
+            subscriptionId     = $subscriptionId
+            subscriptionName   = $subscriptionName
+            activeRegion       = ''
+            resourceCount      = 0
+            totalActiveRegions = 0
+        })
+
+        $subscriptionElapsed = (Get-Date) - $subscriptionStartTime
+        $subscriptionSummaries.Add([pscustomobject]@{
+            subscriptionId        = $subscriptionId
+            subscriptionName      = $subscriptionName
+            status                = 'NoResources'
+            activeRegionCount     = 0
+            resourceCount         = 0
+            quotaDiagnosticCount  = 0
+            elapsed               = $subscriptionElapsed.ToString('hh\:mm\:ss')
+        })
+        Write-Host ("Completed {0} in {1} (no resources found)." -f $subscriptionName, $subscriptionElapsed.ToString('hh\:mm\:ss'))
         continue
     }
 
+    $activeRegions = @(Get-ActiveRegionRecords -Resources $resources)
+    $activeRegionCount = $activeRegions.Count
+    foreach ($region in $activeRegions) {
+        $regionManifestRows.Add([pscustomobject]@{
+            subscriptionId     = $subscriptionId
+            subscriptionName   = $subscriptionName
+            activeRegion       = $region.activeRegion
+            resourceCount      = $region.resourceCount
+            totalActiveRegions = $activeRegionCount
+        })
+    }
+
+    Write-Host ("Discovered {0} active regions in {1}." -f $activeRegionCount, $subscriptionName)
     Write-Host ("Collecting quota usage for providers/regions in {0}..." -f $subscriptionName)
     $diagStartCount = $script:QuotaDiagnostics.Count
-    $quotaMap = Get-QuotaMap -SubscriptionId $subscriptionId -SubscriptionName $subscriptionName -Resources $resources
+    $quotaMap = Get-QuotaMap -SubscriptionId $subscriptionId -SubscriptionName $subscriptionName -Resources $resources -SubscriptionOrdinal $subscriptionOrdinal -SubscriptionCount $subscriptionCount
     $acrQuotaMap = Get-ContainerRegistryQuotaMap -SubscriptionId $subscriptionId -Resources $resources
     $diagAdded = $script:QuotaDiagnostics.Count - $diagStartCount
     if ($diagAdded -gt 0) {
@@ -756,6 +1163,7 @@ foreach ($sub in $subscriptions) {
         }
 
         $allRows.Add([pscustomobject]@{
+            subscriptionId   = $subscriptionId
             subscriptionName = $subscriptionName
             name             = Get-ObjectStringProperty -Object $res -PropertyName 'name'
             type             = Get-ObjectStringProperty -Object $res -PropertyName 'type'
@@ -768,6 +1176,29 @@ foreach ($sub in $subscriptions) {
             quotaMetric      = if ($null -ne $quota) { $quota.quotaMetric } else { $null }
         })
     }
+
+    $subscriptionElapsed = (Get-Date) - $subscriptionStartTime
+    $subscriptionSummaries.Add([pscustomobject]@{
+        subscriptionId        = $subscriptionId
+        subscriptionName      = $subscriptionName
+        status                = 'Completed'
+        activeRegionCount     = $activeRegionCount
+        resourceCount         = $resources.Count
+        quotaDiagnosticCount  = $diagAdded
+        elapsed               = $subscriptionElapsed.ToString('hh\:mm\:ss')
+    })
+    Write-Host ("Completed {0} in {1}." -f $subscriptionName, $subscriptionElapsed.ToString('hh\:mm\:ss'))
+}
+
+$totalElapsed = (Get-Date) - $runStartTime
+Write-Host ("Processed {0} subscriptions in {1}." -f $subscriptionCount, $totalElapsed.ToString('hh\:mm\:ss'))
+if ($subscriptionSummaries.Count -gt 0) {
+    Write-Host 'Subscription timing summary:'
+    $subscriptionSummaries |
+        Sort-Object -Property subscriptionName |
+        ForEach-Object {
+            Write-Host (" - {0}: {1} (status={2}, regions={3}, resources={4}, diagnostics={5})" -f $_.subscriptionName, $_.elapsed, $_.status, $_.activeRegionCount, $_.resourceCount, $_.quotaDiagnosticCount)
+        }
 }
 
 $outputDir = Split-Path -Path $OutputCsvPath -Parent
@@ -776,10 +1207,30 @@ if (-not [string]::IsNullOrWhiteSpace($outputDir) -and -not (Test-Path -LiteralP
 }
 
 $allRows |
-    Sort-Object -Property subscriptionName, type, location, name |
+    Sort-Object -Property subscriptionName, subscriptionId, type, location, name |
     Export-Csv -Path $OutputCsvPath -NoTypeInformation -Encoding UTF8
 
 Write-Host ("Export complete: {0}" -f $OutputCsvPath)
+
+if ([string]::IsNullOrWhiteSpace($RegionManifestPath)) {
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($OutputCsvPath)
+    $dir = Split-Path -Path $OutputCsvPath -Parent
+    if ([string]::IsNullOrWhiteSpace($dir)) {
+        $dir = (Get-Location).Path
+    }
+    $RegionManifestPath = Join-Path -Path $dir -ChildPath ("{0}-active-regions.csv" -f $base)
+}
+
+$regionManifestDir = Split-Path -Path $RegionManifestPath -Parent
+if (-not [string]::IsNullOrWhiteSpace($regionManifestDir) -and -not (Test-Path -LiteralPath $regionManifestDir)) {
+    $null = New-Item -ItemType Directory -Path $regionManifestDir -Force
+}
+
+$regionManifestRows |
+    Sort-Object -Property subscriptionName, subscriptionId, activeRegion |
+    Export-Csv -Path $RegionManifestPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ("Active region manifest exported: {0}" -f $RegionManifestPath)
 
 if ($script:QuotaDiagnostics.Count -gt 0) {
     if ([string]::IsNullOrWhiteSpace($DiagnosticsCsvPath)) {

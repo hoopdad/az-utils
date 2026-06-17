@@ -8,6 +8,15 @@ PowerShell scripts that collect Azure subscription data to support **capacity pl
 # Prerequisites: Azure CLI logged in, PowerShell 7+
 az login
 
+# Quota export for the current az account subscription
+pwsh Export-AzCliResourceQuotaCsv.ps1 -OutputCsvPath ./reports/resource-quota-usage.csv
+
+# Quota export for every enabled subscription visible to the logged-in user
+pwsh Export-AzCliResourceQuotaCsv.ps1 -AllEnabledSubscriptions -OutputCsvPath ./reports/resource-quota-usage.csv
+
+# Quota export for subscriptions from a file with an active-region manifest
+pwsh Export-AzCliResourceQuotaCsv.ps1 -SubscriptionListPath ./subscriptions.txt -OutputCsvPath ./reports/resource-quota-usage.csv
+
 # Single subscription (current or specified)
 pwsh Start-AzCapacityReport.ps1 -OutputPath ./reports
 pwsh Start-AzCapacityReport.ps1 -SubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -OutputPath ./reports
@@ -46,6 +55,22 @@ All scripts require the built-in **Reader** role on each target subscription. Th
 | `Start-AzCapacityReport.ps1` | Runs all scripts above | Reader (subscription) |
 
 ## Scripts
+
+### Export-AzCliResourceQuotaCsv.ps1 — Flat Quota Export
+
+Exports one flat CSV row per resource and attaches the best matching quota metric for that resource's provider and active region. The script supports three explicit subscription targeting modes and writes a companion active-region manifest CSV for traceability.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-SubscriptionIds` | Current az subscription | One or more subscription IDs or names |
+| `-SubscriptionListPath` | — | Text file with one subscription ID or name per line; `#` comments and `id,name` rows are supported |
+| `-AllEnabledSubscriptions` | `False` | Process every enabled subscription visible to the logged-in Azure CLI identity |
+| `-OutputCsvPath` | Timestamped file in current directory | Main flat CSV output |
+| `-RegionFilter` | — | Limit processing to a single region |
+| `-DiagnosticsCsvPath` | Derived from output path | Quota endpoint failure diagnostics |
+| `-RegionManifestPath` | Derived from output path | Companion CSV showing each subscription's active regions and resource counts |
+
+If you use `-AllEnabledSubscriptions` with no `-RegionFilter`, the script processes every enabled subscription and every active region for each subscription, where an active region is any region with at least one deployed resource. Subscriptions where the current identity cannot run `az graph query` are warned and skipped so a tenant-wide run can continue.
 
 ### Start-AzCapacityReport.ps1 — Orchestrator
 
