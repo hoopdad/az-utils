@@ -2,6 +2,8 @@
 
 Azure utility scripts for operational tasks.
 
+👉 **Quick Start:** See [SCRIPTS.md](SCRIPTS.md) for a concise guide on when to run each script and what it provides.
+
 ## Lighthouse Onboarding
 
 PowerShell script to onboard subscriptions for Azure Lighthouse — registers the `Microsoft.ManagedServices` resource provider and assigns the Reader role to specified users.
