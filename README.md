@@ -11,6 +11,7 @@ PowerShell script to onboard subscriptions for Azure Lighthouse — registers th
 See [`lighthouse/README.md`](lighthouse/README.md) for full documentation.
 
 **Quick start**:
+
 ```powershell
 az login
 cd lighthouse
@@ -24,6 +25,7 @@ PowerShell scripts to collect Azure subscription data — resource inventory, re
 See [`capacity-planning/README.md`](capacity-planning/README.md) for full documentation.
 
 **Quick start**:
+
 ```powershell
 az login
 cd capacity-planning
