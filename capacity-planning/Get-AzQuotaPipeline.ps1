@@ -1,5 +1,14 @@
 #Requires -Version 7.0
 <#
+.NOTICE
+    Sample code only. This script is provided "as is" without warranties or
+    guarantees of completeness, accuracy, availability, or fitness for a
+    particular environment. Azure service quota and usage APIs vary by tenant,
+    subscription, region, provider registration state, API version, RBAC, and
+    service support. The customer must review, test, and validate all output
+    in their own Azure environment before relying on it for operational,
+    capacity, financial, compliance, or remediation decisions.
+
 .SYNOPSIS
     Staged pipeline for Azure quota collection across subscriptions and regions.
 

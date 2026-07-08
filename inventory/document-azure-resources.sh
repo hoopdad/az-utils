@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
+#
+# NOTICE:
+# Sample code only. This script is provided "as is" without warranties or
+# guarantees of completeness, accuracy, availability, or fitness for a
+# particular environment. Azure inventory, RBAC, tag, and owner-resolution
+# results can vary by tenant, subscription, API version, RBAC permissions,
+# service support, deleted principals, and Azure CLI behavior. The customer must
+# review, test, and validate all output in their own Azure environment before
+# relying on it for operational, capacity, financial, compliance, or remediation
+# decisions.
 set -Eeuo pipefail
 
 usage() {
     cat <<'USAGE'
 Azure resource inventory exporter.
+
+NOTICE:
+  Sample code only. Provided "as is" without warranties or guarantees.
+  Customer must review, test, and validate all output in their own Azure
+  environment before relying on it for operational, capacity, financial,
+  compliance, or remediation decisions.
 
 Uses Azure CLI to export resources, tags, raw Azure resource types, portal-style
 resource types, and effective Owner RBAC principals to CSV. Owner assignments are

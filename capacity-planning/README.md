@@ -2,6 +2,14 @@
 
 PowerShell scripts that collect Azure subscription data to support **capacity planning** and **region selection** discussions. Each script produces structured JSON output with metadata, summaries, and detailed records.
 
+## Sample code disclaimer
+
+These scripts are sample code provided **as is**, without warranties or guarantees of completeness, accuracy, availability, or fitness for a particular customer environment.
+
+Azure quota, usage, inventory, and provider-registration results can vary by tenant, subscription, region, resource provider registration state, API version, RBAC permissions, service support, and Azure CLI/extension behavior.
+
+Customers must review, test, and validate all scripts and outputs in their own Azure environment before relying on them for operational, capacity, financial, compliance, or remediation decisions. Results should be treated as discovery inputs, not authoritative proof, until validated by the customer.
+
 ## Quick Start
 
 ```powershell
