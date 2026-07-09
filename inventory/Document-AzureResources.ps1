@@ -234,6 +234,7 @@ function Resolve-SubscriptionSelector {
         [string]$Selector,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$Accounts
     )
 
