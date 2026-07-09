@@ -95,9 +95,7 @@ function Invoke-AzJsonSafe {
     $raw = & az @Arguments 2>&1
     $text = ($raw | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) {
-        Write-DebugLog "az exited with code $LASTEXITCODE for: az $($Arguments -join ' ')"
-        if (-not [string]::IsNullOrWhiteSpace($text)) { Write-DebugLog "az error output: $text" }
-        return $null
+        throw "az $($Arguments -join ' ') failed with exit code $LASTEXITCODE. $text"
     }
     if ([string]::IsNullOrWhiteSpace($text)) {
         Write-DebugLog "az returned empty output for: az $($Arguments -join ' ')"
@@ -107,8 +105,7 @@ function Invoke-AzJsonSafe {
         return ($text | ConvertFrom-Json -Depth 100)
     }
     catch {
-        Write-DebugLog "Failed to parse JSON for: az $($Arguments -join ' ') :: $_"
-        return $null
+        throw "Failed to parse JSON for: az $($Arguments -join ' ') :: $_"
     }
 }
 
@@ -118,9 +115,7 @@ function Invoke-AzRestJsonSafe {
     $raw = & az rest --method get --url $Url -o json --only-show-errors 2>&1
     $text = ($raw | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) {
-        Write-DebugLog "az rest exited with code $LASTEXITCODE for: $Url"
-        if (-not [string]::IsNullOrWhiteSpace($text)) { Write-DebugLog "az rest error output: $text" }
-        return $null
+        throw "az rest --method get --url $Url failed with exit code $LASTEXITCODE. $text"
     }
     if ([string]::IsNullOrWhiteSpace($text)) {
         Write-DebugLog "az rest returned empty output for: $Url"
@@ -130,9 +125,34 @@ function Invoke-AzRestJsonSafe {
         return ($text | ConvertFrom-Json -Depth 100)
     }
     catch {
-        Write-DebugLog "Failed to parse JSON for az rest URL: $Url :: $_"
+        throw "Failed to parse JSON for az rest URL: $Url :: $_"
+    }
+}
+
+function Invoke-AzRestJsonOptional {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    try {
+        return Invoke-AzRestJsonSafe -Url $Url
+    }
+    catch {
+        Write-Warning "$Context failed: $_"
         return $null
     }
+}
+
+function Get-GroupCountByName {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Groups,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $group = $Groups | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    if ($group) { return [double]$group.Count }
+    return 0.0
 }
 
 function Write-Stage {
@@ -175,7 +195,13 @@ function Get-QuotaScope {
 function Get-QuotaUsageLookup {
     param([Parameter(Mandatory)][string]$Scope)
     $lookup = @{}
-    $items = Invoke-AzJsonSafe -Arguments @('quota', 'usage', 'list', '--scope', $Scope, '-o', 'json', '--only-show-errors')
+    try {
+        $items = Invoke-AzJsonSafe -Arguments @('quota', 'usage', 'list', '--scope', $Scope, '-o', 'json', '--only-show-errors')
+    }
+    catch {
+        Write-Warning "Quota usage query failed for scope $Scope. Usage values may be blank: $_"
+        return $lookup
+    }
     foreach ($item in @($items)) {
         if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
         $key = Get-QuotaItemKey -Item $item
@@ -306,12 +332,17 @@ function Test-AzPipelineProviderRegistrations {
         foreach ($provider in $providers) {
             $state = 'Unknown'
             $errorText = $null
-            $result = Invoke-AzJsonSafe -Arguments @('provider', 'show', '--namespace', $provider, '--subscription', $sub.SubscriptionId, '-o', 'json', '--only-show-errors')
-            if ($result -and $result.PSObject.Properties['registrationState']) {
-                $state = [string]$result.registrationState
+            try {
+                $result = Invoke-AzJsonSafe -Arguments @('provider', 'show', '--namespace', $provider, '--subscription', $sub.SubscriptionId, '-o', 'json', '--only-show-errors')
+                if ($result -and $result.PSObject.Properties['registrationState']) {
+                    $state = [string]$result.registrationState
+                }
+                else {
+                    $errorText = 'Provider registration state was not present in Azure CLI output.'
+                }
             }
-            else {
-                $errorText = 'Unable to read provider registration state.'
+            catch {
+                $errorText = "Unable to read provider registration state: $_"
             }
 
             [pscustomobject]@{
@@ -473,7 +504,13 @@ function Get-RegionsForSubscription {
         [Parameter(Mandatory)][string]$SubscriptionName
     )
     $query = "Resources | where isnotempty(location) | where tolower(location) != 'global' | summarize ResourceCount=count() by Region=tolower(location)"
-    $result = Invoke-AzJsonSafe -Arguments @('graph', 'query', '-q', $query, '--subscriptions', $SubscriptionId, '--first', '1000', '-o', 'json', '--only-show-errors')
+    try {
+        $result = Invoke-AzJsonSafe -Arguments @('graph', 'query', '-q', $query, '--subscriptions', $SubscriptionId, '--first', '1000', '-o', 'json', '--only-show-errors')
+    }
+    catch {
+        Write-Warning "Region discovery failed for $SubscriptionName ($SubscriptionId): $_"
+        return
+    }
     if (-not $result -or -not $result.data) {
         Write-DebugLog "No region data returned for $SubscriptionName ($SubscriptionId). The az graph (Resource Graph) extension may be missing, or the subscription has no located resources / no read access."
         return
@@ -507,6 +544,7 @@ function Get-AzPipelineRegions {
         try {
             $json = (& az graph query -q $q --subscriptions $subId --first 1000 -o json --only-show-errors 2>&1 | Out-String).Trim()
             if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Region query failed for $subName ($subId) exit=$LASTEXITCODE :: $json"
                 if ($dbg) { Write-Host "[DEBUG] Region query failed for $subName ($subId) exit=$LASTEXITCODE :: $json" -ForegroundColor DarkGray }
             }
             elseif (-not [string]::IsNullOrWhiteSpace($json)) {
@@ -633,7 +671,10 @@ function Get-AzPipelineQuotas {
 
         try {
             $json = (& az vm list-usage --location $region --subscription $subId -o json --only-show-errors 2>&1 | Out-String).Trim()
-            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($json)) {
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Compute quota failed for $subName / $region exit=$LASTEXITCODE :: $json"
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($json)) {
                 foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
                     $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
                     [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true }
@@ -643,7 +684,10 @@ function Get-AzPipelineQuotas {
 
         try {
             $json = (& az network list-usages --location $region --subscription $subId -o json --only-show-errors 2>&1 | Out-String).Trim()
-            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($json)) {
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Network quota failed for $subName / $region exit=$LASTEXITCODE :: $json"
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($json)) {
                 foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
                     $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
                     $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
@@ -658,7 +702,10 @@ function Get-AzPipelineQuotas {
                 $scope = "/subscriptions/$subId/providers/$($p.Namespace)/locations/$region"
                 $usageLookup = @{}
                 $usageJson = (& az quota usage list --scope $scope -o json --only-show-errors 2>&1 | Out-String).Trim()
-                if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($usageJson)) {
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "$($p.Label) quota usage query failed for $subName / $region : $usageJson"
+                }
+                elseif (-not [string]::IsNullOrWhiteSpace($usageJson)) {
                     foreach ($usageItem in @($usageJson | ConvertFrom-Json -Depth 50)) {
                         $usageKey = _Key $usageItem
                         if ([string]::IsNullOrWhiteSpace($usageKey)) { continue }
@@ -671,7 +718,14 @@ function Get-AzPipelineQuotas {
                     }
                 }
                 $json = (& az quota list --scope $scope -o json --only-show-errors 2>&1 | Out-String).Trim()
-                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($json)) { continue }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "$($p.Label) quota list failed for $subName / $region : $json"
+                    continue
+                }
+                if ([string]::IsNullOrWhiteSpace($json)) {
+                    Write-Warning "$($p.Label) quota list returned empty output for $subName / $region"
+                    continue
+                }
                 foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
                     if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
                     $props = $item.properties
@@ -702,7 +756,7 @@ function Get-AzPipelineServiceSpecificLimits {
 
         foreach ($region in $regions) {
             $sqlUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.Sql/locations/$region/usages?api-version=2023-08-01"
-            $sqlUsage = Invoke-AzRestJsonSafe -Url $sqlUrl
+            $sqlUsage = Invoke-AzRestJsonOptional -Url $sqlUrl -Context "Azure SQL usage query for $subName / $region"
             foreach ($item in @($sqlUsage.value)) {
                 if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
                 if (-not (Test-SqlUsageIsQuotaCapacity -Item $item)) { continue }
@@ -716,34 +770,34 @@ function Get-AzPipelineServiceSpecificLimits {
         }
 
         $cosmosUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DocumentDB/databaseAccounts?api-version=2024-11-15"
-        $cosmos = Invoke-AzRestJsonSafe -Url $cosmosUrl
+        $cosmos = Invoke-AzRestJsonOptional -Url $cosmosUrl -Context "Azure Cosmos DB inventory query for $subName"
         if ($cosmos) {
             $used = @($cosmos.value).Count
             New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'Azure Cosmos DB' -QuotaName 'Database accounts per subscription (default)' -Used $used -Limit 250 -Unit 'Count' -IsQuotaApplicable $true
         }
 
         $eventHubUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.EventHub/namespaces?api-version=2024-01-01"
-        $eventHubs = Invoke-AzRestJsonSafe -Url $eventHubUrl
+        $eventHubs = Invoke-AzRestJsonOptional -Url $eventHubUrl -Context "Azure Event Hubs namespace query for $subName"
         if ($eventHubs) {
             $counts = @($eventHubs.value) | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') }
             foreach ($region in $regions) {
-                $used = [double](@($counts | Where-Object { $_.Name -eq $region }).Count | ForEach-Object { if ($_) { $_.Count } else { 0 } })
+                $used = Get-GroupCountByName -Groups $counts -Name $region
                 New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Event Hubs' -QuotaName 'Namespaces per subscription per region' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $true
             }
         }
 
         $serviceBusUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.ServiceBus/namespaces?api-version=2024-01-01"
-        $serviceBus = Invoke-AzRestJsonSafe -Url $serviceBusUrl
+        $serviceBus = Invoke-AzRestJsonOptional -Url $serviceBusUrl -Context "Azure Service Bus namespace query for $subName"
         if ($serviceBus) {
             $counts = @($serviceBus.value) | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') }
             foreach ($region in $regions) {
-                $used = [double](@($counts | Where-Object { $_.Name -eq $region }).Count | ForEach-Object { if ($_) { $_.Count } else { 0 } })
+                $used = Get-GroupCountByName -Groups $counts -Name $region
                 New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Service Bus' -QuotaName 'Namespaces per subscription per region' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $true
             }
         }
 
         $apimUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.ApiManagement/service?api-version=2024-05-01"
-        $apim = Invoke-AzRestJsonSafe -Url $apimUrl
+        $apim = Invoke-AzRestJsonOptional -Url $apimUrl -Context "API Management inventory query for $subName"
         if ($apim) {
             $items = @($apim.value)
             if ($items.Count -eq 0) {
@@ -758,8 +812,8 @@ function Get-AzPipelineServiceSpecificLimits {
 
         $postgresFlexibleUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DBforPostgreSQL/flexibleServers?api-version=2024-08-01"
         $postgresSingleUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DBforPostgreSQL/servers?api-version=2017-12-01"
-        $postgresFlexible = Invoke-AzRestJsonSafe -Url $postgresFlexibleUrl
-        $postgresSingle = Invoke-AzRestJsonSafe -Url $postgresSingleUrl
+        $postgresFlexible = Invoke-AzRestJsonOptional -Url $postgresFlexibleUrl -Context "Azure PostgreSQL flexible server inventory query for $subName"
+        $postgresSingle = Invoke-AzRestJsonOptional -Url $postgresSingleUrl -Context "Azure PostgreSQL single server inventory query for $subName"
         $postgresItems = @()
         if ($postgresFlexible) { $postgresItems += @($postgresFlexible.value) }
         if ($postgresSingle) { $postgresItems += @($postgresSingle.value) }
@@ -794,7 +848,13 @@ function Get-AzPipelineResourceInventory {
     if ($Sequential -or $Subscriptions.Count -le 1) {
         $results = foreach ($sub in $Subscriptions) {
             Write-Host "  Inventory for $($sub.SubscriptionName)..."
-            $result = Invoke-AzJsonSafe -Arguments @('graph', 'query', '-q', $query, '--subscriptions', $sub.SubscriptionId, '--first', '1000', '-o', 'json', '--only-show-errors')
+            try {
+                $result = Invoke-AzJsonSafe -Arguments @('graph', 'query', '-q', $query, '--subscriptions', $sub.SubscriptionId, '--first', '1000', '-o', 'json', '--only-show-errors')
+            }
+            catch {
+                Write-Warning "Inventory query failed for $($sub.SubscriptionName): $_"
+                continue
+            }
             foreach ($row in @($result.data)) {
                 ConvertTo-InventoryRow -Row $row -SubscriptionId $sub.SubscriptionId -SubscriptionName $sub.SubscriptionName
             }
