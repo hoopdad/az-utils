@@ -2,9 +2,8 @@
 .NOTICE
 Sample code only. This script is provided "as is" without warranties or
 guarantees of completeness, accuracy, availability, or fitness for a
-particular environment. Azure inventory, RBAC, tag, and owner-resolution
-results can vary by tenant, subscription, API version, RBAC permissions,
-service support, deleted principals, and Azure CLI behavior. The customer must
+particular environment. Azure inventory, tags, API versions, RBAC permissions,
+service support, and Azure CLI behavior can vary. The customer must
 review, test, and validate all output in their own Azure environment before
 relying on it for operational, capacity, financial, compliance, or remediation
 decisions.
@@ -15,9 +14,7 @@ Exports Azure resource inventory to CSV.
 .DESCRIPTION
 Uses Azure CLI to enumerate resources from one subscription, a list of subscriptions,
 or every subscription visible to the signed-in account. The CSV includes resource
-metadata, raw Azure resource type, portal-style resource type, tags, and principals
-assigned the Owner RBAC role at resource, resource group, subscription, or inherited
-management group scope.
+metadata, raw Azure resource type, portal-style resource type, and tags.
 
 The script assumes you are already signed in to the intended Azure tenant. If you
 provide -Tenant, subscription discovery is filtered to subscriptions whose Azure CLI
@@ -58,9 +55,7 @@ CSV output path. Parent directories are created if needed.
 
 .NOTES
 Preflight checks verify Azure CLI is installed, the session is signed in, and the
-output directory can be created. Owner name resolution uses Azure CLI RBAC output
-first, then best-effort Microsoft Entra lookups. Deleted or inaccessible principals
-are shown as unresolved by principal type instead of exposing raw object ids.
+output directory can be created.
 #>
 [CmdletBinding()]
 param(
@@ -353,223 +348,6 @@ function Convert-ResourceTypeToPortalType {
     return Convert-TokenToTitle -Value $leafType
 }
 
-function Format-OwnerName {
-    param(
-        [AllowNull()]
-        [string]$Name
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Name)) {
-        return ''
-    }
-
-    $trimmed = $Name.Trim()
-    if ($trimmed -match '^([^@]+)@') {
-        return $Matches[1]
-    }
-
-    return $trimmed
-}
-
-function Test-IsGuidLike {
-    param(
-        [AllowNull()]
-        [string]$Value
-    )
-
-    return -not [string]::IsNullOrWhiteSpace($Value) -and
-        $Value.Trim() -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-}
-
-function Get-UnresolvedPrincipalLabel {
-    param(
-        [AllowNull()]
-        [string]$PrincipalType
-    )
-
-    if ([string]::IsNullOrWhiteSpace($PrincipalType)) {
-        return 'Unresolved principal'
-    }
-
-    return "Unresolved $($PrincipalType.Trim())"
-}
-
-function Resolve-PrincipalNameFromDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Assignment,
-
-        [Parameter(Mandatory = $true)]
-        [hashtable]$NameCache
-    )
-
-    $principalId = Get-PropertyValue -Object $Assignment -Name 'principalId'
-    if ([string]::IsNullOrWhiteSpace($principalId)) {
-        return ''
-    }
-
-    if ($NameCache.ContainsKey($principalId)) {
-        return $NameCache[$principalId]
-    }
-
-    $principalType = Get-PropertyValue -Object $Assignment -Name 'principalType'
-    $resolvedName = ''
-
-    try {
-        switch -Regex ($principalType) {
-            '^User$' {
-                $principal = Invoke-AzJson -Arguments @('ad', 'user', 'show', '--id', $principalId, '-o', 'json') -Operation "Resolve user principal '$principalId'" | ConvertFrom-Json
-                $resolvedName = Format-OwnerName -Name (Get-PropertyValue -Object $principal -Name 'userPrincipalName')
-                if (-not $resolvedName) {
-                    $resolvedName = Format-OwnerName -Name (Get-PropertyValue -Object $principal -Name 'mail')
-                }
-                if (-not $resolvedName) {
-                    $resolvedName = Format-OwnerName -Name (Get-PropertyValue -Object $principal -Name 'displayName')
-                }
-                break
-            }
-            '^(Group|ForeignGroup)$' {
-                $principal = Invoke-AzJson -Arguments @('ad', 'group', 'show', '--group', $principalId, '-o', 'json') -Operation "Resolve group principal '$principalId'" | ConvertFrom-Json
-                $resolvedName = Format-OwnerName -Name (Get-PropertyValue -Object $principal -Name 'displayName')
-                if (-not $resolvedName) {
-                    $resolvedName = Format-OwnerName -Name (Get-PropertyValue -Object $principal -Name 'mail')
-                }
-                break
-            }
-            '^ServicePrincipal$' {
-                $principal = Invoke-AzJson -Arguments @('ad', 'sp', 'show', '--id', $principalId, '-o', 'json') -Operation "Resolve service principal '$principalId'" | ConvertFrom-Json
-                $resolvedName = Format-OwnerName -Name (Get-PropertyValue -Object $principal -Name 'appDisplayName')
-                if (-not $resolvedName) {
-                    $resolvedName = Format-OwnerName -Name (Get-PropertyValue -Object $principal -Name 'displayName')
-                }
-                if (-not $resolvedName) {
-                    $servicePrincipalNames = Get-PropertyValue -Object $principal -Name 'servicePrincipalNames'
-                    $resolvedName = Format-OwnerName -Name (@($servicePrincipalNames) | Select-Object -First 1)
-                }
-                break
-            }
-        }
-    } catch {
-        $resolvedName = ''
-    }
-
-    if (-not $resolvedName) {
-        $resolvedName = Get-UnresolvedPrincipalLabel -PrincipalType $principalType
-        Write-Warning "Could not resolve Owner principal '$principalId' ($principalType). CSV will show '$resolvedName'."
-    }
-
-    $NameCache[$principalId] = $resolvedName
-    return $resolvedName
-}
-
-function Get-AssignmentOwnerName {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Assignment,
-
-        [Parameter(Mandatory = $true)]
-        [hashtable]$NameCache
-    )
-
-    foreach ($propertyName in @('principalName', 'principalDisplayName', 'displayName')) {
-        $ownerName = Format-OwnerName -Name (Get-PropertyValue -Object $Assignment -Name $propertyName)
-        if ($ownerName -and -not (Test-IsGuidLike -Value $ownerName)) {
-            return $ownerName
-        }
-    }
-
-    return Resolve-PrincipalNameFromDirectory -Assignment $Assignment -NameCache $NameCache
-}
-
-function Test-IsOwnerAssignment {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Assignment
-    )
-
-    $ownerRoleId = '8e3af657-a8ff-443c-a75c-2fe8c4bcb6350'
-    $roleName = Get-PropertyValue -Object $Assignment -Name 'roleDefinitionName'
-    $roleDefinitionId = Get-PropertyValue -Object $Assignment -Name 'roleDefinitionId'
-
-    return $roleName -eq 'Owner' -or ([string]$roleDefinitionId).ToLowerInvariant().EndsWith($ownerRoleId)
-}
-
-function Normalize-Scope {
-    param(
-        [AllowNull()]
-        [string]$Scope
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Scope)) {
-        return ''
-    }
-
-    return $Scope.Trim().TrimEnd('/').ToLowerInvariant()
-}
-
-function Get-OwnerScopeEntries {
-    param(
-        [Parameter(Mandatory = $true)]
-        [AllowEmptyCollection()]
-        [object[]]$RoleAssignments,
-
-        [Parameter(Mandatory = $true)]
-        [hashtable]$NameCache
-    )
-
-    return @(
-        foreach ($assignment in $RoleAssignments) {
-            if (-not (Test-IsOwnerAssignment -Assignment $assignment)) {
-                continue
-            }
-
-            $scope = Normalize-Scope -Scope (Get-PropertyValue -Object $assignment -Name 'scope')
-            if (-not $scope) {
-                continue
-            }
-
-            # Keep scope matching simple and deterministic during row generation.
-            [pscustomobject]@{
-                Scope = $scope
-                Owner = Get-AssignmentOwnerName -Assignment $assignment -NameCache $NameCache
-            }
-        }
-    )
-}
-
-function Get-OwnersForResource {
-    param(
-        [AllowNull()]
-        [string]$ResourceId,
-
-        [Parameter(Mandatory = $true)]
-        [AllowEmptyCollection()]
-        [object[]]$OwnerScopeEntries
-    )
-
-    $resourceScope = Normalize-Scope -Scope $ResourceId
-    if (-not $resourceScope -or $OwnerScopeEntries.Count -eq 0) {
-        return ''
-    }
-
-    $owners = @(
-        foreach ($entry in $OwnerScopeEntries) {
-            if (-not $entry.Owner) {
-                continue
-            }
-
-            $scope = $entry.Scope
-            if ($scope.StartsWith('/providers/microsoft.management/managementgroups/') -or
-                $resourceScope -eq $scope -or
-                $resourceScope.StartsWith("$scope/")) {
-                $entry.Owner
-            }
-        }
-    ) | Sort-Object -Unique
-
-    return ($owners -join ', ')
-}
-
 function Invoke-AzureResourceInventoryExport {
 Invoke-PreflightChecks -Path $OutputPath
 
@@ -647,7 +425,6 @@ if ($selectedSubscriptions.Count -eq 0) {
 }
 
 $rows = [System.Collections.Generic.List[object]]::new()
-$principalNameCache = @{}
 foreach ($selectedSubscription in $selectedSubscriptions) {
     Write-Status "Collecting resources for $($selectedSubscription.name) [$($selectedSubscription.id)]."
     try {
@@ -656,14 +433,6 @@ foreach ($selectedSubscription in $selectedSubscriptions) {
     } catch {
         Write-Warning "Skipping $($selectedSubscription.name) [$($selectedSubscription.id)]: $($_.Exception.Message)"
         continue
-    }
-
-    try {
-        $roleAssignments = @(Invoke-AzJson -Arguments @('role', 'assignment', 'list', '--subscription', $selectedSubscription.id, '--all', '--include-inherited', '--fill-principal-name', 'true', '-o', 'json') -Operation "List Owner RBAC candidates for subscription '$($selectedSubscription.name)'" | ConvertFrom-Json)
-        $ownerScopeEntries = @(Get-OwnerScopeEntries -RoleAssignments $roleAssignments -NameCache $principalNameCache)
-    } catch {
-        Write-Warning "Owner RBAC lookup failed for $($selectedSubscription.name) [$($selectedSubscription.id)]: $($_.Exception.Message)"
-        $ownerScopeEntries = @()
     }
 
     foreach ($resource in $resources) {
@@ -676,14 +445,13 @@ foreach ($selectedSubscription in $selectedSubscriptions) {
             'resource type' = (Get-PropertyValue -Object $resource -Name 'type')
             'portal type' = (Convert-ResourceTypeToPortalType -ResourceType (Get-PropertyValue -Object $resource -Name 'type'))
             'resource name' = (Get-PropertyValue -Object $resource -Name 'name')
-            'owners' = (Get-OwnersForResource -ResourceId (Get-PropertyValue -Object $resource -Name 'id') -OwnerScopeEntries $ownerScopeEntries)
             'tags' = (Convert-TagsToString -Tags (Get-PropertyValue -Object $resource -Name 'tags'))
         }) | Out-Null
     }
 }
 
 if ($rows.Count -eq 0) {
-    '"subscription id","subscription name","resource group","region","availability zone","resource type","portal type","resource name","owners","tags"' |
+    '"subscription id","subscription name","resource group","region","availability zone","resource type","portal type","resource name","tags"' |
         Set-Content -LiteralPath $OutputPath -Encoding UTF8
 } else {
     $rows | Export-Csv -LiteralPath $OutputPath -NoTypeInformation -Encoding UTF8

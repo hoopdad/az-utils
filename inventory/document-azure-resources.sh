@@ -3,9 +3,8 @@
 # NOTICE:
 # Sample code only. This script is provided "as is" without warranties or
 # guarantees of completeness, accuracy, availability, or fitness for a
-# particular environment. Azure inventory, RBAC, tag, and owner-resolution
-# results can vary by tenant, subscription, API version, RBAC permissions,
-# service support, deleted principals, and Azure CLI behavior. The customer must
+# particular environment. Azure inventory, tags, API versions, RBAC permissions,
+# service support, and Azure CLI behavior can vary. The customer must
 # review, test, and validate all output in their own Azure environment before
 # relying on it for operational, capacity, financial, compliance, or remediation
 # decisions.
@@ -21,11 +20,8 @@ NOTICE:
   environment before relying on it for operational, capacity, financial,
   compliance, or remediation decisions.
 
-Uses Azure CLI to export resources, tags, raw Azure resource types, portal-style
-resource types, and effective Owner RBAC principals to CSV. Owner assignments are
-evaluated at resource, resource group, subscription, and inherited management group
-scopes. If Microsoft Entra name resolution is not available, unresolved owners are
-labeled by principal type instead of exposing raw object ids.
+Uses Azure CLI to export resources, tags, raw Azure resource types, and
+portal-style resource types to CSV.
 
 Usage:
   ./document-azure-resources.sh [options]
@@ -239,7 +235,6 @@ accounts_file="$tmp_dir/accounts.json"
 selectors_file="$tmp_dir/selectors.txt"
 selected_file="$tmp_dir/selected-subscriptions.json"
 resources_file="$tmp_dir/resources.json"
-role_assignments_file="$tmp_dir/role-assignments.json"
 
 # Subscription discovery is tenant-filtered in Python because 'az account list' has
 # no native tenant selector.
@@ -347,7 +342,6 @@ headers = [
     "resource type",
     "portal type",
     "resource name",
-    "owners",
     "tags",
 ]
 
@@ -368,27 +362,15 @@ while IFS=$'\t' read -r subscription_id subscription_name; do
         continue
     fi
 
-    if ! az role assignment list --subscription "$subscription_id" --all --include-inherited --fill-principal-name true -o json > "$role_assignments_file"; then
-        log_warn "Owner RBAC lookup failed for ${subscription_name} [${subscription_id}]. Owner column will be blank for this subscription."
-        printf '[]' > "$role_assignments_file"
-    fi
-
-    rows_added="$("$python_cmd" - "$output_path" "$subscription_id" "$subscription_name" "$resources_file" "$role_assignments_file" <<'PY'
+    rows_added="$("$python_cmd" - "$output_path" "$subscription_id" "$subscription_name" "$resources_file" <<'PY'
 import csv
 import json
-import subprocess
 import sys
 
-output_path, subscription_id, subscription_name, resources_path, role_assignments_path = sys.argv[1:6]
+output_path, subscription_id, subscription_name, resources_path = sys.argv[1:5]
 
 with open(resources_path, "r", encoding="utf-8") as handle:
     resources = json.load(handle)
-
-with open(role_assignments_path, "r", encoding="utf-8") as handle:
-    role_assignments = json.load(handle)
-
-OWNER_ROLE_ID = "8e3af657-a8ff-443c-a75c-2fe8c4bcb6350"
-principal_name_cache = {}
 
 # Keep tags deterministic and compact in a single CSV column.
 def tags_to_text(tags):
@@ -459,124 +441,6 @@ def portal_type_name(resource_type):
         return PORTAL_TYPE_NAMES[normalized]
     return token_to_title(str(resource_type).split("/")[-1])
 
-def format_owner_name(name):
-    if not name:
-        return ""
-    value = str(name).strip()
-    if not value:
-        return ""
-    if "@" in value:
-        return value.split("@", 1)[0]
-    return value
-
-def is_guid_like(value):
-    if not value:
-        return False
-    value = str(value).strip()
-    parts = value.split("-")
-    return (
-        len(parts) == 5
-        and [len(part) for part in parts] == [8, 4, 4, 4, 12]
-        and all(all(character in "0123456789abcdefABCDEF" for character in part) for part in parts)
-    )
-
-# Azure CLI sometimes omits principal names from RBAC output. Directory lookups are
-# best effort and intentionally avoid writing raw object ids when Graph cannot resolve.
-def az_json(args):
-    completed = subprocess.run(
-        ["az", *args, "-o", "json"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0 or not completed.stdout.strip():
-        return None
-    return json.loads(completed.stdout)
-
-def resolve_principal_name(assignment):
-    principal_id = assignment.get("principalId")
-    if not principal_id:
-        return ""
-    if principal_id in principal_name_cache:
-        return principal_name_cache[principal_id]
-
-    principal_type = assignment.get("principalType")
-    principal = None
-    if principal_type == "User":
-        principal = az_json(["ad", "user", "show", "--id", principal_id])
-        candidates = ["userPrincipalName", "mail", "displayName"]
-    elif principal_type in ("Group", "ForeignGroup"):
-        principal = az_json(["ad", "group", "show", "--group", principal_id])
-        candidates = ["displayName", "mail"]
-    elif principal_type == "ServicePrincipal":
-        principal = az_json(["ad", "sp", "show", "--id", principal_id])
-        candidates = ["appDisplayName", "displayName", "servicePrincipalNames"]
-    else:
-        candidates = []
-
-    resolved = ""
-    if isinstance(principal, dict):
-        for candidate in candidates:
-            value = principal.get(candidate)
-            if isinstance(value, list):
-                value = next((item for item in value if item), "")
-            resolved = format_owner_name(value)
-            if resolved:
-                break
-
-    if not resolved:
-        resolved = f"Unresolved {principal_type or 'principal'}"
-        print(
-            f"[WARN] Could not resolve Owner principal '{principal_id}' ({principal_type or 'unknown'}). "
-            f"CSV will show '{resolved}'.",
-            file=sys.stderr,
-        )
-
-    principal_name_cache[principal_id] = resolved
-    return resolved
-
-def owner_name_from_assignment(assignment):
-    for key in ("principalName", "principalDisplayName", "displayName"):
-        owner_name = format_owner_name(assignment.get(key))
-        if owner_name and not is_guid_like(owner_name):
-            return owner_name
-    return resolve_principal_name(assignment)
-
-def is_owner_assignment(assignment):
-    role_name = assignment.get("roleDefinitionName")
-    role_definition_id = str(assignment.get("roleDefinitionId") or "").lower()
-    return role_name == "Owner" or role_definition_id.endswith(OWNER_ROLE_ID)
-
-def normalize_scope(scope):
-    if not scope:
-        return ""
-    return str(scope).strip().rstrip("/").lower()
-
-def assignment_applies_to_resource(assignment_scope, resource_scope):
-    if not assignment_scope or not resource_scope:
-        return False
-    if assignment_scope.startswith("/providers/microsoft.management/managementgroups/"):
-        return True
-    return resource_scope == assignment_scope or resource_scope.startswith(f"{assignment_scope}/")
-
-owner_scope_entries = []
-for assignment in role_assignments:
-    if not is_owner_assignment(assignment):
-        continue
-    scope = normalize_scope(assignment.get("scope"))
-    owner_name = owner_name_from_assignment(assignment)
-    if scope and owner_name:
-        owner_scope_entries.append((scope, owner_name))
-
-def owners_for_resource(resource):
-    resource_scope = normalize_scope(resource.get("id"))
-    owners = {
-        owner_name
-        for scope, owner_name in owner_scope_entries
-        if assignment_applies_to_resource(scope, resource_scope)
-    }
-    return ", ".join(sorted(owners))
-
 with open(output_path, "a", encoding="utf-8", newline="") as handle:
     writer = csv.writer(handle)
     for resource in resources:
@@ -589,7 +453,6 @@ with open(output_path, "a", encoding="utf-8", newline="") as handle:
             resource.get("type", "") or "",
             portal_type_name(resource.get("type")),
             resource.get("name", "") or "",
-            owners_for_resource(resource),
             tags_to_text(resource.get("tags")),
         ])
 
