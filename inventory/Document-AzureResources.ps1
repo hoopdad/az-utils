@@ -45,7 +45,7 @@ CSV output path. Parent directories are created if needed.
 .\Document-AzureResources.ps1 -All -OutputPath .\azure-resources.csv
 
 .EXAMPLE
-.\Document-AzureResources.ps1 -Subscription "00000000-0000-0000-0000-000000000000" -OutputPath .\azure-resources.csv
+.\Document-AzureResources.ps1 -OutputPath .\azure-resources.csv -Subscription "00000000-0000-0000-0000-000000000000"
 
 .EXAMPLE
 .\Document-AzureResources.ps1 -Subscription "Sub A" -Subscription "Sub B" -OutputPath .\azure-resources.csv
@@ -54,7 +54,7 @@ CSV output path. Parent directories are created if needed.
 .\Document-AzureResources.ps1 -SubscriptionFile .\subscriptions.txt -OutputPath .\azure-resources.csv
 
 .EXAMPLE
-.\Document-AzureResources.ps1 -Tenant "00000000-0000-0000-0000-000000000000" -All -OutputPath .\azure-resources.csv
+.\Document-AzureResources.ps1 -All -OutputPath .\azure-resources.csv -Tenant "00000000-0000-0000-0000-000000000000"
 
 .NOTES
 Preflight checks verify Azure CLI is installed, the session is signed in, and the
@@ -509,6 +509,7 @@ function Normalize-Scope {
 function Get-OwnerScopeEntries {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$RoleAssignments,
 
         [Parameter(Mandatory = $true)]
@@ -541,11 +542,12 @@ function Get-OwnersForResource {
         [string]$ResourceId,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$OwnerScopeEntries
     )
 
     $resourceScope = Normalize-Scope -Scope $ResourceId
-    if (-not $resourceScope) {
+    if (-not $resourceScope -or $OwnerScopeEntries.Count -eq 0) {
         return ''
     }
 
