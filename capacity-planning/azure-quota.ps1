@@ -89,43 +89,134 @@ function Write-DebugLog {
     Write-Host "[DEBUG $ts] $Message" -ForegroundColor DarkGray
 }
 
+function Get-AzErrorCategory {
+    param([AllowNull()][string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return 'Unknown' }
+    $text = $Message.ToLowerInvariant()
+    if ($text -match 'serviceunavailable|unknowndownstreamfailure|too ?many requests|throttl|timeout|temporar|please retry again|internalservererror|badgateway|gatewaytimeout|connection reset') {
+        return 'Transient'
+    }
+    if ($text -match 'subscriptionnotregistered|invalidresourcenamespace|missingsubscriptionregistration|not registered to|is not registered|azure subscription id .+ not found|resource namespace .+ is invalid|badrequest|notfound') {
+        return 'UnsupportedOrUnavailable'
+    }
+    return 'Other'
+}
+
+function Get-QuotaCollectionStatusFromError {
+    param([AllowNull()][string]$ErrorText)
+
+    switch (Get-AzErrorCategory -Message $ErrorText) {
+        'Transient' { return 'CollectFailedTransient' }
+        'UnsupportedOrUnavailable' { return 'SkippedUnsupportedOrUnregistered' }
+        default { return 'CollectFailed' }
+    }
+}
+
+function Get-ShortErrorText {
+    param(
+        [AllowNull()][string]$Text,
+        [int]$MaxLength = 280
+    )
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $trimmed = $Text.Trim()
+    if ($trimmed.Length -le $MaxLength) { return $trimmed }
+    return ($trimmed.Substring(0, $MaxLength) + '...')
+}
+
+function Invoke-AzJsonResult {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [ValidateRange(1, 6)][int]$MaxAttempts = 3,
+        [ValidateRange(1, 30)][int]$InitialRetryDelaySeconds = 2
+    )
+
+    $attempt = 0
+    while ($attempt -lt $MaxAttempts) {
+        $attempt++
+        Write-DebugLog "az $($Arguments -join ' ') (attempt $attempt/$MaxAttempts)"
+        $raw = & az @Arguments 2>&1
+        $text = ($raw | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -eq 0) {
+            if ([string]::IsNullOrWhiteSpace($text)) {
+                return [pscustomobject]@{
+                    Success = $true; Data = $null; ExitCode = 0; ErrorText = $null; Category = 'None'; Attempts = $attempt
+                }
+            }
+            try {
+                return [pscustomobject]@{
+                    Success = $true; Data = ($text | ConvertFrom-Json -Depth 100); ExitCode = 0; ErrorText = $null; Category = 'None'; Attempts = $attempt
+                }
+            }
+            catch {
+                return [pscustomobject]@{
+                    Success = $false; Data = $null; ExitCode = 0; ErrorText = "Failed to parse JSON output: $_"; Category = 'Other'; Attempts = $attempt
+                }
+            }
+        }
+
+        $category = Get-AzErrorCategory -Message $text
+        if ($category -eq 'Transient' -and $attempt -lt $MaxAttempts) {
+            $delay = [int][math]::Ceiling($InitialRetryDelaySeconds * [math]::Pow(2, ($attempt - 1)))
+            Write-DebugLog "Transient az failure; retrying in ${delay}s. Message: $(Get-ShortErrorText -Text $text -MaxLength 160)"
+            Start-Sleep -Seconds $delay
+            continue
+        }
+
+        return [pscustomobject]@{
+            Success = $false; Data = $null; ExitCode = $exitCode; ErrorText = $text; Category = $category; Attempts = $attempt
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = $false; Data = $null; ExitCode = -1; ErrorText = 'Azure CLI command failed after retries.'; Category = 'Other'; Attempts = $attempt
+    }
+}
+
 function Invoke-AzJsonSafe {
     param([Parameter(Mandatory)][string[]]$Arguments)
-    Write-DebugLog "az $($Arguments -join ' ')"
-    $raw = & az @Arguments 2>&1
-    $text = ($raw | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) {
-        throw "az $($Arguments -join ' ') failed with exit code $LASTEXITCODE. $text"
+
+    $result = Invoke-AzJsonResult -Arguments $Arguments
+    if (-not $result.Success) {
+        throw "az $($Arguments -join ' ') failed with exit code $($result.ExitCode) ($($result.Category)). $($result.ErrorText)"
     }
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        Write-DebugLog "az returned empty output for: az $($Arguments -join ' ')"
-        return $null
-    }
-    try {
-        return ($text | ConvertFrom-Json -Depth 100)
-    }
-    catch {
-        throw "Failed to parse JSON for: az $($Arguments -join ' ') :: $_"
-    }
+    return $result.Data
 }
 
 function Invoke-AzRestJsonSafe {
     param([Parameter(Mandatory)][string]$Url)
-    Write-DebugLog "az rest --method get --url $Url"
-    $raw = & az rest --method get --url $Url -o json --only-show-errors 2>&1
-    $text = ($raw | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) {
-        throw "az rest --method get --url $Url failed with exit code $LASTEXITCODE. $text"
-    }
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        Write-DebugLog "az rest returned empty output for: $Url"
-        return $null
-    }
-    try {
-        return ($text | ConvertFrom-Json -Depth 100)
-    }
-    catch {
-        throw "Failed to parse JSON for az rest URL: $Url :: $_"
+
+    $maxAttempts = 3
+    $attempt = 0
+    while ($attempt -lt $maxAttempts) {
+        $attempt++
+        Write-DebugLog "az rest --method get --url $Url (attempt $attempt/$maxAttempts)"
+        $raw = & az rest --method get --url $Url -o json --only-show-errors 2>&1
+        $text = ($raw | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0) {
+            if ([string]::IsNullOrWhiteSpace($text)) {
+                Write-DebugLog "az rest returned empty output for: $Url"
+                return $null
+            }
+            try {
+                return ($text | ConvertFrom-Json -Depth 100)
+            }
+            catch {
+                throw "Failed to parse JSON for az rest URL: $Url :: $_"
+            }
+        }
+
+        $category = Get-AzErrorCategory -Message $text
+        if ($category -eq 'Transient' -and $attempt -lt $maxAttempts) {
+            $delay = [int][math]::Ceiling(2 * [math]::Pow(2, ($attempt - 1)))
+            Write-DebugLog "Transient az rest failure; retrying in ${delay}s. Message: $(Get-ShortErrorText -Text $text -MaxLength 160)"
+            Start-Sleep -Seconds $delay
+            continue
+        }
+        throw "az rest --method get --url $Url failed with exit code $exitCode ($category). $text"
     }
 }
 
@@ -165,11 +256,19 @@ function Write-Stage {
     Write-Host "[Stage $Number] $Name - $Status" -ForegroundColor Cyan
 }
 
+function Normalize-QuotaMetricValue {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ([string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
+    try { $number = [double]$Value } catch { return $null }
+    if ($number -lt 0) { return $null }
+    return $number
+}
+
 function Get-UsagePercentValue ([object]$Used, [object]$Limit) {
-    if ($null -eq $Used -or $null -eq $Limit) { return $null }
-    if ([string]::IsNullOrWhiteSpace([string]$Used) -or [string]::IsNullOrWhiteSpace([string]$Limit)) { return $null }
-    $usedValue = [double]$Used
-    $limitValue = [double]$Limit
+    $usedValue = Normalize-QuotaMetricValue -Value $Used
+    $limitValue = Normalize-QuotaMetricValue -Value $Limit
+    if ($null -eq $usedValue -or $null -eq $limitValue) { return $null }
     if ($limitValue -le 0) { return $(if ($usedValue -gt 0) { 100.0 } else { 0.0 }) }
     return [math]::Round(($usedValue / $limitValue) * 100, 2)
 }
@@ -259,7 +358,9 @@ function New-QuotaRow {
         [Parameter(Mandatory)][AllowNull()][object]$Used,
         [Parameter(Mandatory)][AllowNull()][object]$Limit,
         [Parameter(Mandatory)][string]$Unit,
-        [Parameter(Mandatory)][bool]$IsQuotaApplicable
+        [Parameter(Mandatory)][bool]$IsQuotaApplicable,
+        [string]$CollectionStatus = 'Collected',
+        [AllowNull()][string]$CollectionDetail = $null
     )
 
     [pscustomobject]@{
@@ -273,7 +374,62 @@ function New-QuotaRow {
         Unit = $Unit
         UsagePercent = (Get-UsagePercentValue $Used $Limit)
         IsQuotaApplicable = $IsQuotaApplicable
+        CollectionStatus = $CollectionStatus
+        CollectionDetail = $CollectionDetail
     }
+}
+
+function New-QuotaStatusRow {
+    param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$SubscriptionName,
+        [Parameter(Mandatory)][string]$Region,
+        [Parameter(Mandatory)][string]$Provider,
+        [Parameter(Mandatory)][string]$CollectionStatus,
+        [AllowNull()][string]$CollectionDetail
+    )
+
+    New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $Provider -QuotaName 'Collection status' -Used $null -Limit $null -Unit 'N/A' -IsQuotaApplicable $false -CollectionStatus $CollectionStatus -CollectionDetail $CollectionDetail
+}
+
+function Normalize-QuotaRow {
+    param([Parameter(Mandatory)][object]$Row)
+
+    if (-not $Row.PSObject.Properties['CollectionStatus']) {
+        $Row | Add-Member -NotePropertyName CollectionStatus -NotePropertyValue 'Collected'
+    }
+    if (-not $Row.PSObject.Properties['CollectionDetail']) {
+        $Row | Add-Member -NotePropertyName CollectionDetail -NotePropertyValue $null
+    }
+
+    $hadSentinel = $false
+    foreach ($metric in @('Used', 'Limit')) {
+        if (-not $Row.PSObject.Properties[$metric]) { continue }
+        $normalized = Normalize-QuotaMetricValue -Value $Row.$metric
+        if ($null -ne $Row.$metric -and -not [string]::IsNullOrWhiteSpace([string]$Row.$metric) -and $null -eq $normalized) {
+            $hadSentinel = $true
+        }
+        $Row.$metric = $normalized
+    }
+
+    if ($hadSentinel) {
+        if ($Row.PSObject.Properties['IsQuotaApplicable']) { $Row.IsQuotaApplicable = $false }
+        if ([string]::IsNullOrWhiteSpace([string]$Row.CollectionStatus) -or [string]$Row.CollectionStatus -eq 'Collected') {
+            $Row.CollectionStatus = 'CollectedWithSentinelNormalization'
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$Row.CollectionDetail)) {
+            $Row.CollectionDetail = 'Provider returned negative sentinel values; normalized to blank.'
+        }
+    }
+
+    if ($Row.PSObject.Properties['UsagePercent']) {
+        $Row.UsagePercent = Get-UsagePercentValue -Used $Row.Used -Limit $Row.Limit
+    }
+    else {
+        $Row | Add-Member -NotePropertyName UsagePercent -NotePropertyValue (Get-UsagePercentValue -Used $Row.Used -Limit $Row.Limit)
+    }
+
+    return $Row
 }
 
 #endregion
@@ -568,7 +724,8 @@ function Get-QuotasForRegion {
     param(
         [Parameter(Mandatory)][string]$SubscriptionId,
         [Parameter(Mandatory)][string]$SubscriptionName,
-        [Parameter(Mandatory)][string]$Region
+        [Parameter(Mandatory)][string]$Region,
+        [AllowNull()][hashtable]$ProviderReadinessLookup = $null
     )
 
     # Compute
@@ -577,9 +734,15 @@ function Get-QuotasForRegion {
         foreach ($item in @($items)) {
             if ($null -eq $item) { continue }
             $n = Resolve-QuotaName -Item $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (Get-UsagePercentValue $u $l); IsQuotaApplicable = $true }
+            New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider 'Compute' -QuotaName $n -Used $u -Limit $l -Unit 'Count' -IsQuotaApplicable $true
         }
-    } catch { Write-Warning "Compute quota failed for $SubscriptionName / $Region : $_" }
+    }
+    catch {
+        Write-Warning "Compute quota failed for $SubscriptionName / $Region : $_"
+        $detail = Get-ShortErrorText -Text $_.Exception.Message
+        $status = Get-QuotaCollectionStatusFromError -ErrorText $_.Exception.Message
+        New-QuotaStatusRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider 'Compute' -CollectionStatus $status -CollectionDetail $detail
+    }
 
     # Network
     try {
@@ -588,24 +751,45 @@ function Get-QuotasForRegion {
             if ($null -eq $item) { continue }
             $n = Resolve-QuotaName -Item $item; $u = [double]$item.currentValue; $l = [double]$item.limit
             $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
-            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (Get-UsagePercentValue $u $l); IsQuotaApplicable = $true }
+            New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider 'Network' -QuotaName $n -Used $u -Limit $l -Unit $unit -IsQuotaApplicable $true
         }
-    } catch { Write-Warning "Network quota failed for $SubscriptionName / $Region : $_" }
+    }
+    catch {
+        Write-Warning "Network quota failed for $SubscriptionName / $Region : $_"
+        $detail = Get-ShortErrorText -Text $_.Exception.Message
+        $status = Get-QuotaCollectionStatusFromError -ErrorText $_.Exception.Message
+        New-QuotaStatusRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider 'Network' -CollectionStatus $status -CollectionDetail $detail
+    }
 
     # Additional providers via Azure Quota API
     foreach ($provider in $script:QuotaApiProviders) {
+        $readinessKey = ("{0}|{1}" -f $SubscriptionId, $provider.Namespace).ToLowerInvariant()
+        if ($ProviderReadinessLookup -and $ProviderReadinessLookup.ContainsKey($readinessKey) -and -not [bool]$ProviderReadinessLookup[$readinessKey]) {
+            New-QuotaStatusRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $provider.Label -CollectionStatus 'SkippedNotRegistered' -CollectionDetail "Provider namespace $($provider.Namespace) is not registered for this subscription."
+            continue
+        }
         try {
             $scope = Get-QuotaScope -SubscriptionId $SubscriptionId -ProviderNamespace $provider.Namespace -Region $Region
             $usageLookup = Get-QuotaUsageLookup -Scope $scope
             $items = Invoke-AzJsonSafe -Arguments @('quota', 'list', '--scope', $scope, '-o', 'json', '--only-show-errors')
+            if (@($items).Count -eq 0) {
+                New-QuotaStatusRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $provider.Label -CollectionStatus 'NoQuotaData' -CollectionDetail 'Quota API returned no rows for this provider and region.'
+                continue
+            }
             foreach ($item in @($items)) {
                 if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
                 $q = Resolve-QuotaApiItem -Item $item
                 $used = Resolve-QuotaUsageValue -Item $item -UsageLookup $usageLookup
                 $applicable = if ($item.properties.PSObject.Properties['isQuotaApplicable']) { [bool]$item.properties.isQuotaApplicable } else { $true }
-                [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = $provider.Label; QuotaName = $q.Name; Used = $used; Limit = $q.Limit; Unit = $q.Unit; UsagePercent = (Get-UsagePercentValue $used $q.Limit); IsQuotaApplicable = $applicable }
+                New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $provider.Label -QuotaName $q.Name -Used $used -Limit $q.Limit -Unit $q.Unit -IsQuotaApplicable $applicable
             }
-        } catch { Write-Warning "$($provider.Label) quota failed for $SubscriptionName / $Region : $_" }
+        }
+        catch {
+            Write-Warning "$($provider.Label) quota failed for $SubscriptionName / $Region : $_"
+            $detail = Get-ShortErrorText -Text $_.Exception.Message
+            $status = Get-QuotaCollectionStatusFromError -ErrorText $_.Exception.Message
+            New-QuotaStatusRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $provider.Label -CollectionStatus $status -CollectionDetail $detail
+        }
     }
 }
 
@@ -613,25 +797,50 @@ function Get-AzPipelineQuotas {
     param(
         [Parameter(Mandatory)][object[]]$SubsRegions,
         [int]$ThrottleLimit = 8,
-        [switch]$Sequential
+        [switch]$Sequential,
+        [AllowNull()][object[]]$ProviderRegistrations = $null
     )
 
     $total = $SubsRegions.Count
+    $providerReadinessLookup = @{}
+    foreach ($registration in @($ProviderRegistrations)) {
+        if ($null -eq $registration) { continue }
+        if (-not $registration.PSObject.Properties['SubscriptionId'] -or -not $registration.PSObject.Properties['ProviderNamespace']) { continue }
+        $lookupKey = ("{0}|{1}" -f [string]$registration.SubscriptionId, [string]$registration.ProviderNamespace).ToLowerInvariant()
+        $providerReadinessLookup[$lookupKey] = [bool]$registration.Ready
+    }
 
     if ($Sequential -or $total -le 1) {
         $i = 0
         $results = foreach ($item in $SubsRegions) {
             $i++; Write-Host "  [$i/$total] $($item.SubscriptionName) / $($item.Region)"
-            Get-QuotasForRegion -SubscriptionId $item.SubscriptionId -SubscriptionName $item.SubscriptionName -Region $item.Region
+            Get-QuotasForRegion -SubscriptionId $item.SubscriptionId -SubscriptionName $item.SubscriptionName -Region $item.Region -ProviderReadinessLookup $providerReadinessLookup
         }
         return @($results | Where-Object { $null -ne $_ })
     }
 
     Write-Host "  Collecting $total subscription-region combos ($ThrottleLimit parallel)..."
     $quotaProviders = $script:QuotaApiProviders
+    $readinessLookup = $providerReadinessLookup
     $results = $SubsRegions | ForEach-Object -Parallel {
-        $subId = $_.SubscriptionId; $subName = $_.SubscriptionName; $region = $_.Region
+        $subId = [string]$_.SubscriptionId; $subName = [string]$_.SubscriptionName; $region = [string]$_.Region
+        $providers = $using:quotaProviders
+        $providerLookup = $using:readinessLookup
 
+        function _Normalize($value) {
+            if ($null -eq $value) { return $null }
+            if ([string]::IsNullOrWhiteSpace([string]$value)) { return $null }
+            try { $number = [double]$value } catch { return $null }
+            if ($number -lt 0) { return $null }
+            return $number
+        }
+        function _Pct($u, $l) {
+            $uv = _Normalize $u
+            $lv = _Normalize $l
+            if ($null -eq $uv -or $null -eq $lv) { return $null }
+            if ($lv -le 0) { return $(if ($uv -gt 0) { 100.0 } else { 0.0 }) }
+            [math]::Round(($uv / $lv) * 100, 2)
+        }
         function _Name($item) {
             if ($item.PSObject.Properties['localName'] -and -not [string]::IsNullOrWhiteSpace([string]$item.localName)) { return [string]$item.localName }
             if ($null -ne $item.name) {
@@ -640,13 +849,6 @@ function Get-AzPipelineQuotas {
                 if ($item.name.PSObject.Properties['value']) { return [string]$item.name.value }
             }
             return 'Unknown'
-        }
-        function _Pct($u, $l) {
-            if ($null -eq $u -or $null -eq $l) { return $null }
-            if ([string]::IsNullOrWhiteSpace([string]$u) -or [string]::IsNullOrWhiteSpace([string]$l)) { return $null }
-            $uv = [double]$u; $lv = [double]$l
-            if ($lv -le 0) { return $(if ($uv -gt 0) { 100.0 } else { 0.0 }) }
-            [math]::Round(($uv / $lv) * 100, 2)
         }
         function _Key($item) {
             if ($null -eq $item.name) { return $null }
@@ -667,77 +869,158 @@ function Get-AzPipelineQuotas {
             }
             return $null
         }
-
-        try {
-            $json = (& az vm list-usage --location $region --subscription $subId -o json --only-show-errors 2>&1 | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Compute quota failed for $subName / $region exit=$LASTEXITCODE :: $json"
+        function _ErrorCategory([AllowNull()][string]$message) {
+            if ([string]::IsNullOrWhiteSpace($message)) { return 'Unknown' }
+            $text = $message.ToLowerInvariant()
+            if ($text -match 'serviceunavailable|unknowndownstreamfailure|too ?many requests|throttl|timeout|temporar|please retry again|internalservererror|badgateway|gatewaytimeout|connection reset') { return 'Transient' }
+            if ($text -match 'subscriptionnotregistered|invalidresourcenamespace|missingsubscriptionregistration|not registered to|is not registered|azure subscription id .+ not found|resource namespace .+ is invalid|badrequest|notfound') { return 'UnsupportedOrUnavailable' }
+            return 'Other'
+        }
+        function _StatusFromError([AllowNull()][string]$message) {
+            switch (_ErrorCategory $message) {
+                'Transient' { 'CollectFailedTransient' }
+                'UnsupportedOrUnavailable' { 'SkippedUnsupportedOrUnregistered' }
+                default { 'CollectFailed' }
             }
-            elseif (-not [string]::IsNullOrWhiteSpace($json)) {
-                foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
-                    $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true }
-                }
-            }
-        } catch { Write-Warning "Compute quota failed for $subName / $region : $_" }
-
-        try {
-            $json = (& az network list-usages --location $region --subscription $subId -o json --only-show-errors 2>&1 | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Network quota failed for $subName / $region exit=$LASTEXITCODE :: $json"
-            }
-            elseif (-not [string]::IsNullOrWhiteSpace($json)) {
-                foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
-                    $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-                    $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
-                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true }
-                }
-            }
-        } catch { Write-Warning "Network quota failed for $subName / $region : $_" }
-
-        # Additional providers via Azure Quota API
-        foreach ($p in $using:quotaProviders) {
-            try {
-                $scope = "/subscriptions/$subId/providers/$($p.Namespace)/locations/$region"
-                $usageLookup = @{}
-                $usageJson = (& az quota usage list --scope $scope -o json --only-show-errors 2>&1 | Out-String).Trim()
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Warning "$($p.Label) quota usage query failed for $subName / $region : $usageJson"
-                }
-                elseif (-not [string]::IsNullOrWhiteSpace($usageJson)) {
-                    foreach ($usageItem in @($usageJson | ConvertFrom-Json -Depth 50)) {
-                        $usageKey = _Key $usageItem
-                        if ([string]::IsNullOrWhiteSpace($usageKey)) { continue }
-                        if ($usageItem.PSObject.Properties['properties'] -and
-                            $usageItem.properties.PSObject.Properties['usages'] -and
-                            $null -ne $usageItem.properties.usages -and
-                            $usageItem.properties.usages.PSObject.Properties['value']) {
-                            $usageLookup[$usageKey] = [double]$usageItem.properties.usages.value
-                        }
+        }
+        function _Short([AllowNull()][string]$text, [int]$maxLength = 280) {
+            if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+            $trimmed = $text.Trim()
+            if ($trimmed.Length -le $maxLength) { return $trimmed }
+            return ($trimmed.Substring(0, $maxLength) + '...')
+        }
+        function _InvokeJson([string[]]$arguments) {
+            $maxAttempts = 3
+            $attempt = 0
+            while ($attempt -lt $maxAttempts) {
+                $attempt++
+                $text = (& az @arguments 2>&1 | Out-String).Trim()
+                $exitCode = $LASTEXITCODE
+                if ($exitCode -eq 0) {
+                    if ([string]::IsNullOrWhiteSpace($text)) {
+                        return [pscustomobject]@{ Success = $true; Data = $null; ErrorText = $null; Category = 'None'; ExitCode = 0; Attempts = $attempt }
+                    }
+                    try {
+                        return [pscustomobject]@{ Success = $true; Data = ($text | ConvertFrom-Json -Depth 50); ErrorText = $null; Category = 'None'; ExitCode = 0; Attempts = $attempt }
+                    }
+                    catch {
+                        return [pscustomobject]@{ Success = $false; Data = $null; ErrorText = "Failed to parse JSON output: $_"; Category = 'Other'; ExitCode = 0; Attempts = $attempt }
                     }
                 }
-                $json = (& az quota list --scope $scope -o json --only-show-errors 2>&1 | Out-String).Trim()
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Warning "$($p.Label) quota list failed for $subName / $region : $json"
+                $category = _ErrorCategory $text
+                if ($category -eq 'Transient' -and $attempt -lt $maxAttempts) {
+                    Start-Sleep -Seconds ([int][math]::Ceiling(2 * [math]::Pow(2, ($attempt - 1))))
                     continue
                 }
-                if ([string]::IsNullOrWhiteSpace($json)) {
-                    Write-Warning "$($p.Label) quota list returned empty output for $subName / $region"
-                    continue
+                return [pscustomobject]@{ Success = $false; Data = $null; ErrorText = $text; Category = $category; ExitCode = $exitCode; Attempts = $attempt }
+            }
+            return [pscustomobject]@{ Success = $false; Data = $null; ErrorText = 'Azure CLI command failed after retries.'; Category = 'Other'; ExitCode = -1; Attempts = $attempt }
+        }
+        function _QuotaRow([string]$provider, [string]$quotaName, [object]$used, [object]$limit, [string]$unit, [bool]$isApplicable, [string]$status = 'Collected', [AllowNull()][string]$detail = $null) {
+            [pscustomobject]@{
+                SubscriptionId = $subId
+                SubscriptionName = $subName
+                Region = $region
+                Provider = $provider
+                QuotaName = $quotaName
+                Used = $used
+                Limit = $limit
+                Unit = $unit
+                UsagePercent = (_Pct $used $limit)
+                IsQuotaApplicable = $isApplicable
+                CollectionStatus = $status
+                CollectionDetail = $detail
+            }
+        }
+        function _StatusRow([string]$provider, [string]$status, [AllowNull()][string]$detail) {
+            _QuotaRow -provider $provider -quotaName 'Collection status' -used $null -limit $null -unit 'N/A' -isApplicable $false -status $status -detail $detail
+        }
+
+        $compute = _InvokeJson @('vm', 'list-usage', '--location', $region, '--subscription', $subId, '-o', 'json', '--only-show-errors')
+        if (-not $compute.Success) {
+            Write-Warning "Compute quota failed for $subName / $region : $($compute.ErrorText)"
+            _StatusRow -provider 'Compute' -status (_StatusFromError $compute.ErrorText) -detail (_Short $compute.ErrorText)
+        }
+        else {
+            foreach ($item in @($compute.Data)) {
+                if ($null -eq $item) { continue }
+                $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
+                _QuotaRow -provider 'Compute' -quotaName $n -used $u -limit $l -unit 'Count' -isApplicable $true
+            }
+        }
+
+        $network = _InvokeJson @('network', 'list-usages', '--location', $region, '--subscription', $subId, '-o', 'json', '--only-show-errors')
+        if (-not $network.Success) {
+            Write-Warning "Network quota failed for $subName / $region : $($network.ErrorText)"
+            _StatusRow -provider 'Network' -status (_StatusFromError $network.ErrorText) -detail (_Short $network.ErrorText)
+        }
+        else {
+            foreach ($item in @($network.Data)) {
+                if ($null -eq $item) { continue }
+                $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
+                $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
+                _QuotaRow -provider 'Network' -quotaName $n -used $u -limit $l -unit $unit -isApplicable $true
+            }
+        }
+
+        foreach ($p in $providers) {
+            $lookupKey = ("{0}|{1}" -f $subId, $p.Namespace).ToLowerInvariant()
+            if ($providerLookup.ContainsKey($lookupKey) -and -not [bool]$providerLookup[$lookupKey]) {
+                _StatusRow -provider $p.Label -status 'SkippedNotRegistered' -detail "Provider namespace $($p.Namespace) is not registered for this subscription."
+                continue
+            }
+
+            $scope = "/subscriptions/$subId/providers/$($p.Namespace)/locations/$region"
+            $usageLookup = @{}
+            $usageResult = _InvokeJson @('quota', 'usage', 'list', '--scope', $scope, '-o', 'json', '--only-show-errors')
+            if (-not $usageResult.Success) {
+                Write-Warning "$($p.Label) quota usage query failed for $subName / $region : $($usageResult.ErrorText)"
+            }
+            else {
+                foreach ($usageItem in @($usageResult.Data)) {
+                    $usageKey = _Key $usageItem
+                    if ([string]::IsNullOrWhiteSpace($usageKey)) { continue }
+                    if ($usageItem.PSObject.Properties['properties'] -and
+                        $usageItem.properties.PSObject.Properties['usages'] -and
+                        $null -ne $usageItem.properties.usages -and
+                        $usageItem.properties.usages.PSObject.Properties['value']) {
+                        $usageLookup[$usageKey] = [double]$usageItem.properties.usages.value
+                    }
                 }
-                foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
-                    if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
-                    $props = $item.properties
-                    $applicable = if ($props.PSObject.Properties['isQuotaApplicable']) { [bool]$props.isQuotaApplicable } else { $true }
-                    $n = _Name $props
-                    if ($n -eq 'Unknown' -and $item.name -is [string]) { $n = $item.name }
-                    $u = _UsageValue $item $usageLookup
-                    $l = 0.0
-                    if ($props.PSObject.Properties['limit']  -and $null -ne $props.limit  -and $props.limit.PSObject.Properties['value'])  { $l = [double]$props.limit.value }
-                    $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
-                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = $p.Label; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $applicable }
+            }
+
+            $listResult = _InvokeJson @('quota', 'list', '--scope', $scope, '-o', 'json', '--only-show-errors')
+            if (-not $listResult.Success) {
+                Write-Warning "$($p.Label) quota list failed for $subName / $region : $($listResult.ErrorText)"
+                _StatusRow -provider $p.Label -status (_StatusFromError $listResult.ErrorText) -detail (_Short $listResult.ErrorText)
+                continue
+            }
+
+            if (@($listResult.Data).Count -eq 0) {
+                Write-Warning "$($p.Label) quota list returned empty output for $subName / $region"
+                _StatusRow -provider $p.Label -status 'NoQuotaData' -detail 'Quota API returned no rows for this provider and region.'
+                continue
+            }
+
+            foreach ($item in @($listResult.Data)) {
+                if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
+                $props = $item.properties
+                $applicable = if ($props.PSObject.Properties['isQuotaApplicable']) { [bool]$props.isQuotaApplicable } else { $true }
+                $n = _Name $props
+                if ($n -eq 'Unknown' -and $item.name -is [string]) { $n = $item.name }
+                $u = _UsageValue $item $usageLookup
+                $l = 0.0
+                if ($props.PSObject.Properties['limit'] -and $null -ne $props.limit -and $props.limit.PSObject.Properties['value']) { $l = [double]$props.limit.value }
+                $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
+
+                $status = 'Collected'
+                $detail = $null
+                if (-not $usageResult.Success -and $null -eq $u) {
+                    $status = 'CollectedWithMissingUsage'
+                    $detail = 'Usage endpoint failed; quota list values were collected.'
                 }
-            } catch { Write-Warning "$($p.Label) quota failed for $subName / $region : $_" }
+                _QuotaRow -provider $p.Label -quotaName $n -used $u -limit $l -unit $unit -isApplicable $applicable -status $status -detail $detail
+            }
         }
     } -ThrottleLimit $ThrottleLimit
 
@@ -969,14 +1252,14 @@ $providerRegistrations | Sort-Object SubscriptionName, ProviderNamespace | Expor
 $notRegistered = @($providerRegistrations | Where-Object { -not $_.Ready })
 Write-Host "  Provider registration report -> $providerRegistrationCsvPath"
 if ($notRegistered.Count -gt 0) {
-    Write-Warning "$($notRegistered.Count) provider registration(s) are not Registered. Quota rows may be incomplete until prerequisites are registered."
+    Write-Warning "$($notRegistered.Count) provider registration(s) are not Registered. Quota output will include explicit status rows (SkippedNotRegistered) for those providers."
 }
 
 Write-Stage -Number 4 -Name 'Quotas' -Status "Collecting quota data ($($subsRegions.Count) targets)..."
 $quotas = @(
-    Get-AzPipelineQuotas -SubsRegions $subsRegions -ThrottleLimit $throttle -Sequential:$Sequential
+    Get-AzPipelineQuotas -SubsRegions $subsRegions -ThrottleLimit $throttle -Sequential:$Sequential -ProviderRegistrations $providerRegistrations
     Get-AzPipelineServiceSpecificLimits -SubsRegions $subsRegions
-)
+) | ForEach-Object { Normalize-QuotaRow -Row $_ }
 $quotas | Sort-Object SubscriptionName, Region, Provider, QuotaName | Export-Csv -Path $quotaCsvPath -NoTypeInformation -Encoding UTF8
 
 Write-Stage -Number 5 -Name 'Inventory' -Status 'Collecting business service inventory...'
@@ -992,8 +1275,8 @@ Write-Host "  Provider prereqs: $providerRegistrationCsvPath"
 Write-Host "  Quotas:        $quotaCsvPath ($($quotas.Count) rows)"
 Write-Host "  Inventory:     $inventoryCsvPath ($($inventory.Count) rows)"
 
-$warnings = @($quotas | Where-Object { [double]$_.UsagePercent -gt 80 })
-$critical = @($quotas | Where-Object { [double]$_.UsagePercent -gt 90 })
+$warnings = @($quotas | Where-Object { $_.IsQuotaApplicable -and $null -ne $_.UsagePercent -and [double]$_.UsagePercent -gt 80 })
+$critical = @($quotas | Where-Object { $_.IsQuotaApplicable -and $null -ne $_.UsagePercent -and [double]$_.UsagePercent -gt 90 })
 if ($warnings.Count -gt 0) {
     Write-Host "`n  Quotas >80%: $($warnings.Count)  |  >90%: $($critical.Count)" -ForegroundColor Yellow
     $critical | Sort-Object { [double]$_.UsagePercent } -Descending |
