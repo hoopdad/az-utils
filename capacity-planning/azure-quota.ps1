@@ -146,10 +146,11 @@ function Invoke-AzRestJsonOptional {
 
 function Get-GroupCountByName {
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Groups,
+        [AllowNull()][AllowEmptyCollection()][object[]]$Groups,
         [Parameter(Mandatory)][string]$Name
     )
 
+    if ($null -eq $Groups) { return 0.0 }
     $group = $Groups | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
     if ($group) { return [double]$group.Count }
     return 0.0
@@ -285,10 +286,8 @@ function New-QuotaRow {
 # by service-specific fallback collection below.
 # To add a provider: append @{ Label = 'Display Name'; Namespace = 'Microsoft.Provider' }
 $script:QuotaApiProviders = @(
-    @{ Label = 'Compute (classic)';          Namespace = 'Microsoft.ClassicCompute' }
     @{ Label = 'Machine Learning';           Namespace = 'Microsoft.MachineLearningServices' }
     @{ Label = 'Storage';                    Namespace = 'Microsoft.Storage' }
-    @{ Label = 'Storage (classic)';          Namespace = 'Microsoft.ClassicStorage' }
     @{ Label = 'HPC Cache';                  Namespace = 'Microsoft.StorageCache' }
     @{ Label = 'Azure HDInsight';            Namespace = 'Microsoft.HDInsight' }
     @{ Label = 'Azure Lab Services';         Namespace = 'Microsoft.LabServices' }
