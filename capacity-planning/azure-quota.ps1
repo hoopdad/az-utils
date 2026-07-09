@@ -173,6 +173,17 @@ function Get-UsagePercentValue ([object]$Used, [object]$Limit) {
     return [math]::Round(($usedValue / $limitValue) * 100, 2)
 }
 
+function Get-QuotaUsagePercentValue {
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$Used,
+        [Parameter(Mandatory)][AllowNull()][object]$Limit,
+        [Parameter(Mandatory)][AllowNull()][Nullable[bool]]$IsQuotaApplicable
+    )
+
+    if ($IsQuotaApplicable -ne $true) { return $null }
+    return (Get-UsagePercentValue $Used $Limit)
+}
+
 function Get-QuotaItemKey {
     param([Parameter(Mandatory)][object]$Item)
     if ($null -eq $Item.name) { return $null }
@@ -258,7 +269,8 @@ function New-QuotaRow {
         [Parameter(Mandatory)][AllowNull()][object]$Used,
         [Parameter(Mandatory)][AllowNull()][object]$Limit,
         [Parameter(Mandatory)][string]$Unit,
-        [Parameter(Mandatory)][bool]$IsQuotaApplicable
+        [Parameter(Mandatory)][AllowNull()][Nullable[bool]]$IsQuotaApplicable,
+        [Parameter(Mandatory)][string]$ApplicabilityReason
     )
 
     [pscustomobject]@{
@@ -270,8 +282,9 @@ function New-QuotaRow {
         Used = $Used
         Limit = $Limit
         Unit = $Unit
-        UsagePercent = (Get-UsagePercentValue $Used $Limit)
+        UsagePercent = (Get-QuotaUsagePercentValue -Used $Used -Limit $Limit -IsQuotaApplicable $IsQuotaApplicable)
         IsQuotaApplicable = $IsQuotaApplicable
+        ApplicabilityReason = $ApplicabilityReason
     }
 }
 
@@ -390,6 +403,7 @@ function New-InventoryRow {
         ResourceType = $ResourceType
         Count = $Count
         IsQuotaApplicable = $false
+        ApplicabilityReason = 'InventoryOnly'
     }
 }
 
@@ -578,7 +592,7 @@ function Get-QuotasForRegion {
         foreach ($item in @($items)) {
             if ($null -eq $item) { continue }
             $n = Resolve-QuotaName -Item $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (Get-UsagePercentValue $u $l); IsQuotaApplicable = $true }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (Get-QuotaUsagePercentValue -Used $u -Limit $l -IsQuotaApplicable $true); IsQuotaApplicable = $true; ApplicabilityReason = 'QuotaMetric' }
         }
     } catch { Write-Warning "Compute quota failed for $SubscriptionName / $Region : $_" }
 
@@ -589,7 +603,7 @@ function Get-QuotasForRegion {
             if ($null -eq $item) { continue }
             $n = Resolve-QuotaName -Item $item; $u = [double]$item.currentValue; $l = [double]$item.limit
             $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
-            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (Get-UsagePercentValue $u $l); IsQuotaApplicable = $true }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (Get-QuotaUsagePercentValue -Used $u -Limit $l -IsQuotaApplicable $true); IsQuotaApplicable = $true; ApplicabilityReason = 'QuotaMetric' }
         }
     } catch { Write-Warning "Network quota failed for $SubscriptionName / $Region : $_" }
 
@@ -603,8 +617,13 @@ function Get-QuotasForRegion {
                 if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
                 $q = Resolve-QuotaApiItem -Item $item
                 $used = Resolve-QuotaUsageValue -Item $item -UsageLookup $usageLookup
-                $applicable = if ($item.properties.PSObject.Properties['isQuotaApplicable']) { [bool]$item.properties.isQuotaApplicable } else { $true }
-                [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = $provider.Label; QuotaName = $q.Name; Used = $used; Limit = $q.Limit; Unit = $q.Unit; UsagePercent = (Get-UsagePercentValue $used $q.Limit); IsQuotaApplicable = $applicable }
+                $applicable = $null
+                $applicabilityReason = 'QuotaApiFlagMissing'
+                if ($item.properties.PSObject.Properties['isQuotaApplicable']) {
+                    $applicable = [bool]$item.properties.isQuotaApplicable
+                    $applicabilityReason = if ($applicable) { 'QuotaApiFlagTrue' } else { 'QuotaApiFlagFalse' }
+                }
+                [pscustomobject]@{ SubscriptionId = $SubscriptionId; SubscriptionName = $SubscriptionName; Region = $Region; Provider = $provider.Label; QuotaName = $q.Name; Used = $used; Limit = $q.Limit; Unit = $q.Unit; UsagePercent = (Get-QuotaUsagePercentValue -Used $used -Limit $q.Limit -IsQuotaApplicable $applicable); IsQuotaApplicable = $applicable; ApplicabilityReason = $applicabilityReason }
             }
         } catch { Write-Warning "$($provider.Label) quota failed for $SubscriptionName / $Region : $_" }
     }
@@ -677,7 +696,7 @@ function Get-AzPipelineQuotas {
             elseif (-not [string]::IsNullOrWhiteSpace($json)) {
                 foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
                     $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true }
+                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Compute'; QuotaName = $n; Used = $u; Limit = $l; Unit = 'Count'; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true; ApplicabilityReason = 'QuotaMetric' }
                 }
             }
         } catch { Write-Warning "Compute quota failed for $subName / $region : $_" }
@@ -691,7 +710,7 @@ function Get-AzPipelineQuotas {
                 foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
                     $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
                     $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
-                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true }
+                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = 'Network'; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $true; ApplicabilityReason = 'QuotaMetric' }
                 }
             }
         } catch { Write-Warning "Network quota failed for $subName / $region : $_" }
@@ -729,14 +748,20 @@ function Get-AzPipelineQuotas {
                 foreach ($item in @($json | ConvertFrom-Json -Depth 50)) {
                     if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
                     $props = $item.properties
-                    $applicable = if ($props.PSObject.Properties['isQuotaApplicable']) { [bool]$props.isQuotaApplicable } else { $true }
+                    $applicable = $null
+                    $applicabilityReason = 'QuotaApiFlagMissing'
+                    if ($props.PSObject.Properties['isQuotaApplicable']) {
+                        $applicable = [bool]$props.isQuotaApplicable
+                        $applicabilityReason = if ($applicable) { 'QuotaApiFlagTrue' } else { 'QuotaApiFlagFalse' }
+                    }
                     $n = _Name $props
                     if ($n -eq 'Unknown' -and $item.name -is [string]) { $n = $item.name }
                     $u = _UsageValue $item $usageLookup
                     $l = 0.0
                     if ($props.PSObject.Properties['limit']  -and $null -ne $props.limit  -and $props.limit.PSObject.Properties['value'])  { $l = [double]$props.limit.value }
                     $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
-                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = $p.Label; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = (_Pct $u $l); IsQuotaApplicable = $applicable }
+                    $pct = if ($applicable -eq $true) { (_Pct $u $l) } else { $null }
+                    [pscustomobject]@{ SubscriptionId = $subId; SubscriptionName = $subName; Region = $region; Provider = $p.Label; QuotaName = $n; Used = $u; Limit = $l; Unit = $unit; UsagePercent = $pct; IsQuotaApplicable = $applicable; ApplicabilityReason = $applicabilityReason }
                 }
             } catch { Write-Warning "$($p.Label) quota failed for $subName / $region : $_" }
         }
@@ -765,7 +790,7 @@ function Get-AzPipelineServiceSpecificLimits {
                 $used = if ($props.PSObject.Properties['currentValue']) { [double]$props.currentValue } else { 0.0 }
                 $limit = if ($props.PSObject.Properties['limit']) { [double]$props.limit } else { 0.0 }
                 $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure SQL' -QuotaName $name -Used $used -Limit $limit -Unit $unit -IsQuotaApplicable $true
+                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure SQL' -QuotaName $name -Used $used -Limit $limit -Unit $unit -IsQuotaApplicable $true -ApplicabilityReason 'ServiceUsageQuota'
             }
         }
 
@@ -773,7 +798,7 @@ function Get-AzPipelineServiceSpecificLimits {
         $cosmos = Invoke-AzRestJsonOptional -Url $cosmosUrl -Context "Azure Cosmos DB inventory query for $subName"
         if ($cosmos) {
             $used = @($cosmos.value).Count
-            New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'Azure Cosmos DB' -QuotaName 'Database accounts per subscription (default)' -Used $used -Limit 250 -Unit 'Count' -IsQuotaApplicable $true
+            New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'Azure Cosmos DB' -QuotaName 'Database accounts per subscription (default)' -Used $used -Limit 250 -Unit 'Count' -IsQuotaApplicable $true -ApplicabilityReason 'ServiceDocumentedQuota'
         }
 
         $eventHubUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.EventHub/namespaces?api-version=2024-01-01"
@@ -782,7 +807,7 @@ function Get-AzPipelineServiceSpecificLimits {
             $counts = @($eventHubs.value) | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') }
             foreach ($region in $regions) {
                 $used = Get-GroupCountByName -Groups $counts -Name $region
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Event Hubs' -QuotaName 'Namespaces per subscription per region' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $true
+                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Event Hubs' -QuotaName 'Namespaces per subscription per region' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $true -ApplicabilityReason 'ServiceDocumentedQuota'
             }
         }
 
@@ -792,7 +817,7 @@ function Get-AzPipelineServiceSpecificLimits {
             $counts = @($serviceBus.value) | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') }
             foreach ($region in $regions) {
                 $used = Get-GroupCountByName -Groups $counts -Name $region
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Service Bus' -QuotaName 'Namespaces per subscription per region' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $true
+                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Service Bus' -QuotaName 'Namespaces per subscription per region' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $true -ApplicabilityReason 'ServiceDocumentedQuota'
             }
         }
 
@@ -801,11 +826,11 @@ function Get-AzPipelineServiceSpecificLimits {
         if ($apim) {
             $items = @($apim.value)
             if ($items.Count -eq 0) {
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'API Management' -QuotaName 'Service instances inventory (limits are per instance/tier)' -Used 0 -Limit 0 -Unit 'Count' -IsQuotaApplicable $false
+                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'API Management' -QuotaName 'Service instances inventory (limits are per instance/tier)' -Used 0 -Limit 0 -Unit 'Count' -IsQuotaApplicable $false -ApplicabilityReason 'InventoryOnlyFallback'
             }
             else {
                 foreach ($group in ($items | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') })) {
-                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $group.Name -Provider 'API Management' -QuotaName 'Service instances inventory (limits are per instance/tier)' -Used ([double]$group.Count) -Limit 0 -Unit 'Count' -IsQuotaApplicable $false
+                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $group.Name -Provider 'API Management' -QuotaName 'Service instances inventory (limits are per instance/tier)' -Used ([double]$group.Count) -Limit 0 -Unit 'Count' -IsQuotaApplicable $false -ApplicabilityReason 'InventoryOnlyFallback'
                 }
             }
         }
@@ -819,11 +844,11 @@ function Get-AzPipelineServiceSpecificLimits {
         if ($postgresSingle) { $postgresItems += @($postgresSingle.value) }
         if ($postgresFlexible -or $postgresSingle) {
             if ($postgresItems.Count -eq 0) {
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'Azure PostgreSQL' -QuotaName 'Servers inventory (service quota API unavailable)' -Used 0 -Limit 0 -Unit 'Count' -IsQuotaApplicable $false
+                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'Azure PostgreSQL' -QuotaName 'Servers inventory (service quota API unavailable)' -Used 0 -Limit 0 -Unit 'Count' -IsQuotaApplicable $false -ApplicabilityReason 'InventoryOnlyFallback'
             }
             else {
                 foreach ($group in ($postgresItems | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') })) {
-                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $group.Name -Provider 'Azure PostgreSQL' -QuotaName 'Servers inventory (service quota API unavailable)' -Used ([double]$group.Count) -Limit 0 -Unit 'Count' -IsQuotaApplicable $false
+                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $group.Name -Provider 'Azure PostgreSQL' -QuotaName 'Servers inventory (service quota API unavailable)' -Used ([double]$group.Count) -Limit 0 -Unit 'Count' -IsQuotaApplicable $false -ApplicabilityReason 'InventoryOnlyFallback'
                 }
             }
         }
@@ -889,6 +914,7 @@ function Get-AzPipelineResourceInventory {
                         ResourceType = $resourceType
                         Count = [int]$count
                         IsQuotaApplicable = $false
+                        ApplicabilityReason = 'InventoryOnly'
                     }
                 }
             }
@@ -993,8 +1019,8 @@ Write-Host "  Provider prereqs: $providerRegistrationCsvPath"
 Write-Host "  Quotas:        $quotaCsvPath ($($quotas.Count) rows)"
 Write-Host "  Inventory:     $inventoryCsvPath ($($inventory.Count) rows)"
 
-$warnings = @($quotas | Where-Object { [double]$_.UsagePercent -gt 80 })
-$critical = @($quotas | Where-Object { [double]$_.UsagePercent -gt 90 })
+$warnings = @($quotas | Where-Object { $_.IsQuotaApplicable -eq $true -and ($_.Limit -as [double]) -gt 0 -and ($_.UsagePercent -as [double]) -gt 80 })
+$critical = @($quotas | Where-Object { $_.IsQuotaApplicable -eq $true -and ($_.Limit -as [double]) -gt 0 -and ($_.UsagePercent -as [double]) -gt 90 })
 if ($warnings.Count -gt 0) {
     Write-Host "`n  Quotas >80%: $($warnings.Count)  |  >90%: $($critical.Count)" -ForegroundColor Yellow
     $critical | Sort-Object { [double]$_.UsagePercent } -Descending |
