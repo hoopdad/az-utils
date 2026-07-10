@@ -119,7 +119,7 @@ function Get-ShortErrorText {
         [int]$MaxLength = 280
     )
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-    $trimmed = $Text.Trim()
+    $trimmed = (($Text -replace '\s+', ' ').Trim())
     if ($trimmed.Length -le $MaxLength) { return $trimmed }
     return ($trimmed.Substring(0, $MaxLength) + '...')
 }
@@ -261,6 +261,7 @@ function Normalize-QuotaMetricValue {
     if ($null -eq $Value) { return $null }
     if ([string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
     try { $number = [double]$Value } catch { return $null }
+    if ($number -gt 1000000000) { return $null }
     if ($number -lt 0) { return $null }
     return $number
 }
@@ -300,7 +301,11 @@ function Get-QuotaUsageLookup {
     }
     catch {
         Write-Warning "Quota usage query failed for scope $Scope. Usage values may be blank: $_"
-        return $lookup
+        return [pscustomobject]@{
+            Lookup = $lookup
+            Success = $false
+            ErrorText = $_.Exception.Message
+        }
     }
     foreach ($item in @($items)) {
         if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
@@ -310,7 +315,11 @@ function Get-QuotaUsageLookup {
             $lookup[$key] = [double]$item.properties.usages.value
         }
     }
-    return $lookup
+    return [pscustomobject]@{
+        Lookup = $lookup
+        Success = $true
+        ErrorText = $null
+    }
 }
 
 function Resolve-QuotaUsageValue {
@@ -360,7 +369,9 @@ function New-QuotaRow {
         [Parameter(Mandatory)][string]$Unit,
         [Parameter(Mandatory)][bool]$IsQuotaApplicable,
         [string]$CollectionStatus = 'Collected',
-        [AllowNull()][string]$CollectionDetail = $null
+        [AllowNull()][string]$CollectionDetail = $null,
+        [ValidateSet('Quota', 'Status')][string]$RowType = 'Quota',
+        [AllowNull()][string]$NotApplicableReason = $null
     )
 
     [pscustomobject]@{
@@ -372,8 +383,12 @@ function New-QuotaRow {
         Used = $Used
         Limit = $Limit
         Unit = $Unit
+        Available = $null
         UsagePercent = (Get-UsagePercentValue $Used $Limit)
         IsQuotaApplicable = $IsQuotaApplicable
+        NotApplicableReason = $NotApplicableReason
+        RowType = $RowType
+        CustomerStatus = $null
         CollectionStatus = $CollectionStatus
         CollectionDetail = $CollectionDetail
     }
@@ -389,7 +404,7 @@ function New-QuotaStatusRow {
         [AllowNull()][string]$CollectionDetail
     )
 
-    New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $Provider -QuotaName 'Collection status' -Used $null -Limit $null -Unit 'N/A' -IsQuotaApplicable $false -CollectionStatus $CollectionStatus -CollectionDetail $CollectionDetail
+    New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $Provider -QuotaName 'Collection status' -Used $null -Limit $null -Unit 'N/A' -IsQuotaApplicable $false -CollectionStatus $CollectionStatus -CollectionDetail $CollectionDetail -RowType 'Status' -NotApplicableReason 'StatusOnly'
 }
 
 function Normalize-QuotaRow {
@@ -400,6 +415,18 @@ function Normalize-QuotaRow {
     }
     if (-not $Row.PSObject.Properties['CollectionDetail']) {
         $Row | Add-Member -NotePropertyName CollectionDetail -NotePropertyValue $null
+    }
+    if (-not $Row.PSObject.Properties['RowType']) {
+        $Row | Add-Member -NotePropertyName RowType -NotePropertyValue 'Quota'
+    }
+    if (-not $Row.PSObject.Properties['NotApplicableReason']) {
+        $Row | Add-Member -NotePropertyName NotApplicableReason -NotePropertyValue $null
+    }
+    if (-not $Row.PSObject.Properties['Available']) {
+        $Row | Add-Member -NotePropertyName Available -NotePropertyValue $null
+    }
+    if (-not $Row.PSObject.Properties['CustomerStatus']) {
+        $Row | Add-Member -NotePropertyName CustomerStatus -NotePropertyValue $null
     }
 
     $hadSentinel = $false
@@ -420,14 +447,52 @@ function Normalize-QuotaRow {
         if ([string]::IsNullOrWhiteSpace([string]$Row.CollectionDetail)) {
             $Row.CollectionDetail = 'Provider returned negative sentinel values; normalized to blank.'
         }
+        if ([string]::IsNullOrWhiteSpace([string]$Row.NotApplicableReason)) {
+            $Row.NotApplicableReason = 'ProviderSentinelValue'
+        }
     }
 
-    if ($Row.PSObject.Properties['UsagePercent']) {
-        $Row.UsagePercent = Get-UsagePercentValue -Used $Row.Used -Limit $Row.Limit
+    if ($Row.PSObject.Properties['CollectionDetail']) {
+        $Row.CollectionDetail = Get-ShortErrorText -Text ([string]$Row.CollectionDetail) -MaxLength 280
+    }
+
+    if ($Row.PSObject.Properties['IsQuotaApplicable'] -and -not [bool]$Row.IsQuotaApplicable) {
+        if ([string]::IsNullOrWhiteSpace([string]$Row.NotApplicableReason)) {
+            $Row.NotApplicableReason = 'NotApplicable'
+        }
+        $Row.UsagePercent = $null
+        $Row.Available = $null
     }
     else {
-        $Row | Add-Member -NotePropertyName UsagePercent -NotePropertyValue (Get-UsagePercentValue -Used $Row.Used -Limit $Row.Limit)
+        if ($Row.PSObject.Properties['UsagePercent']) {
+            $Row.UsagePercent = Get-UsagePercentValue -Used $Row.Used -Limit $Row.Limit
+        }
+        else {
+            $Row | Add-Member -NotePropertyName UsagePercent -NotePropertyValue (Get-UsagePercentValue -Used $Row.Used -Limit $Row.Limit)
+        }
+        $usedValue = Normalize-QuotaMetricValue -Value $Row.Used
+        $limitValue = Normalize-QuotaMetricValue -Value $Row.Limit
+        if ($null -eq $usedValue -or $null -eq $limitValue) {
+            $Row.Available = $null
+        }
+        else {
+            $Row.Available = [math]::Round(($limitValue - $usedValue), 2)
+        }
     }
+
+    $statusMap = @{
+        'Collected' = 'Collected'
+        'CollectedWithSentinelNormalization' = 'CollectedNormalized'
+        'CollectedWithMissingUsage' = 'CollectedMissingUsage'
+        'CollectedWithPartialSourceFailure' = 'CollectedPartial'
+        'NoQuotaData' = 'NotCollectedNoData'
+        'SkippedNotRegistered' = 'NotCollectedNotRegistered'
+        'SkippedUnsupportedOrUnregistered' = 'NotCollectedUnsupported'
+        'CollectFailedTransient' = 'NotCollectedTransient'
+        'CollectFailed' = 'NotCollectedFailed'
+    }
+    $statusKey = [string]$Row.CollectionStatus
+    $Row.CustomerStatus = if ($statusMap.ContainsKey($statusKey)) { $statusMap[$statusKey] } else { 'Unknown' }
 
     return $Row
 }
@@ -519,7 +584,7 @@ function Resolve-QuotaApiItem {
     $n = Resolve-QuotaName -Item $props
     if ($n -eq 'Unknown' -and $Item.name -is [string]) { $n = $Item.name }
 
-    $u = 0.0; $l = 0.0
+    $u = $null; $l = $null
     if ($props.PSObject.Properties['usages'] -and $null -ne $props.usages -and $props.usages.PSObject.Properties['value']) { $u = [double]$props.usages.value }
     if ($props.PSObject.Properties['limit']  -and $null -ne $props.limit  -and $props.limit.PSObject.Properties['value'])  { $l = [double]$props.limit.value }
     $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
@@ -734,7 +799,9 @@ function Get-QuotasForRegion {
         foreach ($item in @($items)) {
             if ($null -eq $item) { continue }
             $n = Resolve-QuotaName -Item $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-            New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider 'Compute' -QuotaName $n -Used $u -Limit $l -Unit 'Count' -IsQuotaApplicable $true
+            $isApplicable = ($l -gt 0)
+            $reason = if ($isApplicable) { $null } else { 'ZeroLimitOrNotAvailableInRegion' }
+            New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider 'Compute' -QuotaName $n -Used $u -Limit $l -Unit 'Count' -IsQuotaApplicable $isApplicable -NotApplicableReason $reason
         }
     }
     catch {
@@ -751,7 +818,9 @@ function Get-QuotasForRegion {
             if ($null -eq $item) { continue }
             $n = Resolve-QuotaName -Item $item; $u = [double]$item.currentValue; $l = [double]$item.limit
             $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
-            New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider 'Network' -QuotaName $n -Used $u -Limit $l -Unit $unit -IsQuotaApplicable $true
+            $isApplicable = ($l -gt 0)
+            $reason = if ($isApplicable) { $null } else { 'ZeroLimitOrNotAvailableInRegion' }
+            New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider 'Network' -QuotaName $n -Used $u -Limit $l -Unit $unit -IsQuotaApplicable $isApplicable -NotApplicableReason $reason
         }
     }
     catch {
@@ -770,7 +839,8 @@ function Get-QuotasForRegion {
         }
         try {
             $scope = Get-QuotaScope -SubscriptionId $SubscriptionId -ProviderNamespace $provider.Namespace -Region $Region
-            $usageLookup = Get-QuotaUsageLookup -Scope $scope
+            $usageResult = Get-QuotaUsageLookup -Scope $scope
+            $usageLookup = $usageResult.Lookup
             $items = Invoke-AzJsonSafe -Arguments @('quota', 'list', '--scope', $scope, '-o', 'json', '--only-show-errors')
             if (@($items).Count -eq 0) {
                 New-QuotaStatusRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $provider.Label -CollectionStatus 'NoQuotaData' -CollectionDetail 'Quota API returned no rows for this provider and region.'
@@ -781,7 +851,13 @@ function Get-QuotasForRegion {
                 $q = Resolve-QuotaApiItem -Item $item
                 $used = Resolve-QuotaUsageValue -Item $item -UsageLookup $usageLookup
                 $applicable = if ($item.properties.PSObject.Properties['isQuotaApplicable']) { [bool]$item.properties.isQuotaApplicable } else { $true }
-                New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $provider.Label -QuotaName $q.Name -Used $used -Limit $q.Limit -Unit $q.Unit -IsQuotaApplicable $applicable
+                $status = 'Collected'
+                $detail = $null
+                if (-not $usageResult.Success -and $null -eq $used) {
+                    $status = 'CollectedWithMissingUsage'
+                    $detail = 'Usage endpoint failed; quota list values were collected.'
+                }
+                New-QuotaRow -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -Region $Region -Provider $provider.Label -QuotaName $q.Name -Used $used -Limit $q.Limit -Unit $q.Unit -IsQuotaApplicable $applicable -CollectionStatus $status -CollectionDetail $detail
             }
         }
         catch {
@@ -831,6 +907,7 @@ function Get-AzPipelineQuotas {
             if ($null -eq $value) { return $null }
             if ([string]::IsNullOrWhiteSpace([string]$value)) { return $null }
             try { $number = [double]$value } catch { return $null }
+            if ($number -gt 1000000000) { return $null }
             if ($number -lt 0) { return $null }
             return $number
         }
@@ -885,7 +962,7 @@ function Get-AzPipelineQuotas {
         }
         function _Short([AllowNull()][string]$text, [int]$maxLength = 280) {
             if ([string]::IsNullOrWhiteSpace($text)) { return $null }
-            $trimmed = $text.Trim()
+            $trimmed = (($text -replace '\s+', ' ').Trim())
             if ($trimmed.Length -le $maxLength) { return $trimmed }
             return ($trimmed.Substring(0, $maxLength) + '...')
         }
@@ -916,7 +993,7 @@ function Get-AzPipelineQuotas {
             }
             return [pscustomobject]@{ Success = $false; Data = $null; ErrorText = 'Azure CLI command failed after retries.'; Category = 'Other'; ExitCode = -1; Attempts = $attempt }
         }
-        function _QuotaRow([string]$provider, [string]$quotaName, [object]$used, [object]$limit, [string]$unit, [bool]$isApplicable, [string]$status = 'Collected', [AllowNull()][string]$detail = $null) {
+        function _QuotaRow([string]$provider, [string]$quotaName, [object]$used, [object]$limit, [string]$unit, [bool]$isApplicable, [string]$status = 'Collected', [AllowNull()][string]$detail = $null, [AllowNull()][string]$notApplicableReason = $null) {
             [pscustomobject]@{
                 SubscriptionId = $subId
                 SubscriptionName = $subName
@@ -926,14 +1003,35 @@ function Get-AzPipelineQuotas {
                 Used = $used
                 Limit = $limit
                 Unit = $unit
+                Available = $null
                 UsagePercent = (_Pct $used $limit)
                 IsQuotaApplicable = $isApplicable
+                NotApplicableReason = $notApplicableReason
+                RowType = 'Quota'
+                CustomerStatus = $null
                 CollectionStatus = $status
                 CollectionDetail = $detail
             }
         }
         function _StatusRow([string]$provider, [string]$status, [AllowNull()][string]$detail) {
-            _QuotaRow -provider $provider -quotaName 'Collection status' -used $null -limit $null -unit 'N/A' -isApplicable $false -status $status -detail $detail
+            [pscustomobject]@{
+                SubscriptionId = $subId
+                SubscriptionName = $subName
+                Region = $region
+                Provider = $provider
+                QuotaName = 'Collection status'
+                Used = $null
+                Limit = $null
+                Unit = 'N/A'
+                Available = $null
+                UsagePercent = $null
+                IsQuotaApplicable = $false
+                NotApplicableReason = 'StatusOnly'
+                RowType = 'Status'
+                CustomerStatus = $null
+                CollectionStatus = $status
+                CollectionDetail = $detail
+            }
         }
 
         $compute = _InvokeJson @('vm', 'list-usage', '--location', $region, '--subscription', $subId, '-o', 'json', '--only-show-errors')
@@ -945,7 +1043,9 @@ function Get-AzPipelineQuotas {
             foreach ($item in @($compute.Data)) {
                 if ($null -eq $item) { continue }
                 $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
-                _QuotaRow -provider 'Compute' -quotaName $n -used $u -limit $l -unit 'Count' -isApplicable $true
+                $isApplicable = ($l -gt 0)
+                $reason = if ($isApplicable) { $null } else { 'ZeroLimitOrNotAvailableInRegion' }
+                _QuotaRow -provider 'Compute' -quotaName $n -used $u -limit $l -unit 'Count' -isApplicable $isApplicable -notApplicableReason $reason
             }
         }
 
@@ -959,7 +1059,9 @@ function Get-AzPipelineQuotas {
                 if ($null -eq $item) { continue }
                 $n = _Name $item; $u = [double]$item.currentValue; $l = [double]$item.limit
                 $unit = if ($item.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$item.unit)) { [string]$item.unit } else { 'Count' }
-                _QuotaRow -provider 'Network' -quotaName $n -used $u -limit $l -unit $unit -isApplicable $true
+                $isApplicable = ($l -gt 0)
+                $reason = if ($isApplicable) { $null } else { 'ZeroLimitOrNotAvailableInRegion' }
+                _QuotaRow -provider 'Network' -quotaName $n -used $u -limit $l -unit $unit -isApplicable $isApplicable -notApplicableReason $reason
             }
         }
 
@@ -1028,7 +1130,30 @@ function Get-AzPipelineQuotas {
 }
 
 function Get-AzPipelineServiceSpecificLimits {
-    param([Parameter(Mandatory)][object[]]$SubsRegions)
+    param(
+        [Parameter(Mandatory)][object[]]$SubsRegions,
+        [AllowNull()][object[]]$ProviderRegistrations = $null
+    )
+
+    $providerReadinessLookup = @{}
+    foreach ($registration in @($ProviderRegistrations)) {
+        if ($null -eq $registration) { continue }
+        if (-not $registration.PSObject.Properties['SubscriptionId'] -or -not $registration.PSObject.Properties['ProviderNamespace']) { continue }
+        $lookupKey = ("{0}|{1}" -f [string]$registration.SubscriptionId, [string]$registration.ProviderNamespace).ToLowerInvariant()
+        $providerReadinessLookup[$lookupKey] = [bool]$registration.Ready
+    }
+
+    function Test-ProviderReady {
+        param(
+            [Parameter(Mandatory)][string]$SubscriptionId,
+            [Parameter(Mandatory)][string]$Namespace
+        )
+
+        $lookupKey = ("{0}|{1}" -f $SubscriptionId, $Namespace).ToLowerInvariant()
+        if ($providerReadinessLookup.Count -eq 0) { return $true }
+        if (-not $providerReadinessLookup.ContainsKey($lookupKey)) { return $true }
+        return [bool]$providerReadinessLookup[$lookupKey]
+    }
 
     $subGroups = $SubsRegions | Group-Object SubscriptionId
     foreach ($subGroup in $subGroups) {
@@ -1036,78 +1161,169 @@ function Get-AzPipelineServiceSpecificLimits {
         $subName = [string](@($subGroup.Group)[0].SubscriptionName)
         $regions = @($subGroup.Group | ForEach-Object { [string]$_.Region } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
 
-        foreach ($region in $regions) {
-            $sqlUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.Sql/locations/$region/usages?api-version=2023-08-01"
-            $sqlUsage = Invoke-AzRestJsonOptional -Url $sqlUrl -Context "Azure SQL usage query for $subName / $region"
-            foreach ($item in @($sqlUsage.value)) {
-                if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
-                if (-not (Test-SqlUsageIsQuotaCapacity -Item $item)) { continue }
-                $props = $item.properties
-                $name = if (-not [string]::IsNullOrWhiteSpace([string]$props.displayName)) { [string]$props.displayName } else { [string]$item.name }
-                $used = if ($props.PSObject.Properties['currentValue']) { [double]$props.currentValue } else { 0.0 }
-                $limit = if ($props.PSObject.Properties['limit']) { [double]$props.limit } else { 0.0 }
-                $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure SQL' -QuotaName $name -Used $used -Limit $limit -Unit $unit -IsQuotaApplicable $true
-            }
-        }
-
-        $cosmosUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DocumentDB/databaseAccounts?api-version=2024-11-15"
-        $cosmos = Invoke-AzRestJsonOptional -Url $cosmosUrl -Context "Azure Cosmos DB inventory query for $subName"
-        if ($cosmos) {
-            $used = @($cosmos.value).Count
-            New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'Azure Cosmos DB' -QuotaName 'Database accounts per subscription (default)' -Used $used -Limit 250 -Unit 'Count' -IsQuotaApplicable $true
-        }
-
-        $eventHubUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.EventHub/namespaces?api-version=2024-01-01"
-        $eventHubs = Invoke-AzRestJsonOptional -Url $eventHubUrl -Context "Azure Event Hubs namespace query for $subName"
-        if ($eventHubs) {
-            $counts = @($eventHubs.value) | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') }
+        if (Test-ProviderReady -SubscriptionId $subId -Namespace 'Microsoft.Sql') {
             foreach ($region in $regions) {
-                $used = Get-GroupCountByName -Groups $counts -Name $region
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Event Hubs' -QuotaName 'Namespaces per subscription per region' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $true
-            }
-        }
+                $sqlUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.Sql/locations/$region/usages?api-version=2023-08-01"
+                try {
+                    $sqlUsage = Invoke-AzRestJsonSafe -Url $sqlUrl
+                }
+                catch {
+                    $detail = Get-ShortErrorText -Text $_.Exception.Message
+                    $status = Get-QuotaCollectionStatusFromError -ErrorText $_.Exception.Message
+                    New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure SQL' -CollectionStatus $status -CollectionDetail $detail
+                    continue
+                }
 
-        $serviceBusUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.ServiceBus/namespaces?api-version=2024-01-01"
-        $serviceBus = Invoke-AzRestJsonOptional -Url $serviceBusUrl -Context "Azure Service Bus namespace query for $subName"
-        if ($serviceBus) {
-            $counts = @($serviceBus.value) | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') }
-            foreach ($region in $regions) {
-                $used = Get-GroupCountByName -Groups $counts -Name $region
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Service Bus' -QuotaName 'Namespaces per subscription per region' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $true
-            }
-        }
+                $emittedSqlRow = $false
+                foreach ($item in @($sqlUsage.value)) {
+                    if ($null -eq $item -or -not $item.PSObject.Properties['properties']) { continue }
+                    if (-not (Test-SqlUsageIsQuotaCapacity -Item $item)) { continue }
+                    $props = $item.properties
+                    $name = if (-not [string]::IsNullOrWhiteSpace([string]$props.displayName)) { [string]$props.displayName } else { [string]$item.name }
+                    $used = if ($props.PSObject.Properties['currentValue']) { [double]$props.currentValue } else { 0.0 }
+                    $limit = if ($props.PSObject.Properties['limit']) { [double]$props.limit } else { 0.0 }
+                    $unit = if ($props.PSObject.Properties['unit'] -and -not [string]::IsNullOrWhiteSpace([string]$props.unit)) { [string]$props.unit } else { 'Count' }
+                    $isApplicable = ($limit -gt 0)
+                    $reason = if ($isApplicable) { $null } else { 'ZeroLimitOrNotAvailableInRegion' }
+                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure SQL' -QuotaName $name -Used $used -Limit $limit -Unit $unit -IsQuotaApplicable $isApplicable -NotApplicableReason $reason
+                    $emittedSqlRow = $true
+                }
 
-        $apimUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.ApiManagement/service?api-version=2024-05-01"
-        $apim = Invoke-AzRestJsonOptional -Url $apimUrl -Context "API Management inventory query for $subName"
-        if ($apim) {
-            $items = @($apim.value)
-            if ($items.Count -eq 0) {
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'API Management' -QuotaName 'Service instances inventory (limits are per instance/tier)' -Used 0 -Limit 0 -Unit 'Count' -IsQuotaApplicable $false
-            }
-            else {
-                foreach ($group in ($items | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') })) {
-                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $group.Name -Provider 'API Management' -QuotaName 'Service instances inventory (limits are per instance/tier)' -Used ([double]$group.Count) -Limit 0 -Unit 'Count' -IsQuotaApplicable $false
+                if (-not $emittedSqlRow) {
+                    New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure SQL' -CollectionStatus 'NoQuotaData' -CollectionDetail 'SQL usage API returned no quota-capacity rows.'
                 }
             }
         }
-
-        $postgresFlexibleUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DBforPostgreSQL/flexibleServers?api-version=2024-08-01"
-        $postgresSingleUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DBforPostgreSQL/servers?api-version=2017-12-01"
-        $postgresFlexible = Invoke-AzRestJsonOptional -Url $postgresFlexibleUrl -Context "Azure PostgreSQL flexible server inventory query for $subName"
-        $postgresSingle = Invoke-AzRestJsonOptional -Url $postgresSingleUrl -Context "Azure PostgreSQL single server inventory query for $subName"
-        $postgresItems = @()
-        if ($postgresFlexible) { $postgresItems += @($postgresFlexible.value) }
-        if ($postgresSingle) { $postgresItems += @($postgresSingle.value) }
-        if ($postgresFlexible -or $postgresSingle) {
-            if ($postgresItems.Count -eq 0) {
-                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'subscription' -Provider 'Azure PostgreSQL' -QuotaName 'Servers inventory (service quota API unavailable)' -Used 0 -Limit 0 -Unit 'Count' -IsQuotaApplicable $false
+        else {
+            foreach ($region in $regions) {
+                New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure SQL' -CollectionStatus 'SkippedNotRegistered' -CollectionDetail 'Provider namespace Microsoft.Sql is not registered for this subscription.'
             }
-            else {
-                foreach ($group in ($postgresItems | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') })) {
-                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $group.Name -Provider 'Azure PostgreSQL' -QuotaName 'Servers inventory (service quota API unavailable)' -Used ([double]$group.Count) -Limit 0 -Unit 'Count' -IsQuotaApplicable $false
+        }
+
+        if (Test-ProviderReady -SubscriptionId $subId -Namespace 'Microsoft.DocumentDB') {
+            $cosmosUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DocumentDB/databaseAccounts?api-version=2024-11-15"
+            try {
+                $cosmos = Invoke-AzRestJsonSafe -Url $cosmosUrl
+                $used = @($cosmos.value).Count
+                New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'Azure Cosmos DB' -QuotaName 'Database accounts per subscription (default limit estimate)' -Used $used -Limit 250 -Unit 'Count' -IsQuotaApplicable $false -NotApplicableReason 'DefaultLimitEstimate' -CollectionDetail 'Limit uses documented default and may differ if a quota increase was approved.'
+            }
+            catch {
+                $detail = Get-ShortErrorText -Text $_.Exception.Message
+                $status = Get-QuotaCollectionStatusFromError -ErrorText $_.Exception.Message
+                New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'Azure Cosmos DB' -CollectionStatus $status -CollectionDetail $detail
+            }
+        }
+        else {
+            New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'Azure Cosmos DB' -CollectionStatus 'SkippedNotRegistered' -CollectionDetail 'Provider namespace Microsoft.DocumentDB is not registered for this subscription.'
+        }
+
+        if (Test-ProviderReady -SubscriptionId $subId -Namespace 'Microsoft.EventHub') {
+            $eventHubUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.EventHub/namespaces?api-version=2024-01-01"
+            try {
+                $eventHubs = Invoke-AzRestJsonSafe -Url $eventHubUrl
+                $counts = @($eventHubs.value) | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') }
+                foreach ($region in $regions) {
+                    $used = Get-GroupCountByName -Groups $counts -Name $region
+                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Event Hubs' -QuotaName 'Namespaces per subscription per region (default limit estimate)' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $false -NotApplicableReason 'DefaultLimitEstimate' -CollectionDetail 'Limit uses documented default and may differ if a quota increase was approved.'
                 }
             }
+            catch {
+                $detail = Get-ShortErrorText -Text $_.Exception.Message
+                $status = Get-QuotaCollectionStatusFromError -ErrorText $_.Exception.Message
+                foreach ($region in $regions) {
+                    New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Event Hubs' -CollectionStatus $status -CollectionDetail $detail
+                }
+            }
+        }
+        else {
+            foreach ($region in $regions) {
+                New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Event Hubs' -CollectionStatus 'SkippedNotRegistered' -CollectionDetail 'Provider namespace Microsoft.EventHub is not registered for this subscription.'
+            }
+        }
+
+        if (Test-ProviderReady -SubscriptionId $subId -Namespace 'Microsoft.ServiceBus') {
+            $serviceBusUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.ServiceBus/namespaces?api-version=2024-01-01"
+            try {
+                $serviceBus = Invoke-AzRestJsonSafe -Url $serviceBusUrl
+                $counts = @($serviceBus.value) | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') }
+                foreach ($region in $regions) {
+                    $used = Get-GroupCountByName -Groups $counts -Name $region
+                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Service Bus' -QuotaName 'Namespaces per subscription per region (default limit estimate)' -Used $used -Limit 1000 -Unit 'Count' -IsQuotaApplicable $false -NotApplicableReason 'DefaultLimitEstimate' -CollectionDetail 'Limit uses documented default and may differ if a quota increase was approved.'
+                }
+            }
+            catch {
+                $detail = Get-ShortErrorText -Text $_.Exception.Message
+                $status = Get-QuotaCollectionStatusFromError -ErrorText $_.Exception.Message
+                foreach ($region in $regions) {
+                    New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Service Bus' -CollectionStatus $status -CollectionDetail $detail
+                }
+            }
+        }
+        else {
+            foreach ($region in $regions) {
+                New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region $region -Provider 'Azure Service Bus' -CollectionStatus 'SkippedNotRegistered' -CollectionDetail 'Provider namespace Microsoft.ServiceBus is not registered for this subscription.'
+            }
+        }
+
+        if (Test-ProviderReady -SubscriptionId $subId -Namespace 'Microsoft.ApiManagement') {
+            $apimUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.ApiManagement/service?api-version=2024-05-01"
+            try {
+                $apim = Invoke-AzRestJsonSafe -Url $apimUrl
+                $items = @($apim.value)
+                if ($items.Count -eq 0) {
+                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'API Management' -QuotaName 'Service instances inventory (limits are per instance/tier)' -Used 0 -Limit 0 -Unit 'Count' -IsQuotaApplicable $false -NotApplicableReason 'PerInstanceLimit'
+                }
+                else {
+                    foreach ($group in ($items | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') })) {
+                        New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $group.Name -Provider 'API Management' -QuotaName 'Service instances inventory (limits are per instance/tier)' -Used ([double]$group.Count) -Limit 0 -Unit 'Count' -IsQuotaApplicable $false -NotApplicableReason 'PerInstanceLimit'
+                    }
+                }
+            }
+            catch {
+                $detail = Get-ShortErrorText -Text $_.Exception.Message
+                $status = Get-QuotaCollectionStatusFromError -ErrorText $_.Exception.Message
+                New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'API Management' -CollectionStatus $status -CollectionDetail $detail
+            }
+        }
+        else {
+            New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'API Management' -CollectionStatus 'SkippedNotRegistered' -CollectionDetail 'Provider namespace Microsoft.ApiManagement is not registered for this subscription.'
+        }
+
+        if (Test-ProviderReady -SubscriptionId $subId -Namespace 'Microsoft.DBforPostgreSQL') {
+            $postgresFlexibleUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DBforPostgreSQL/flexibleServers?api-version=2024-08-01"
+            $postgresSingleUrl = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.DBforPostgreSQL/servers?api-version=2017-12-01"
+            $postgresFlexible = $null
+            $postgresSingle = $null
+            $postgresErrors = @()
+
+            try { $postgresFlexible = Invoke-AzRestJsonSafe -Url $postgresFlexibleUrl } catch { $postgresErrors += $_.Exception.Message }
+            try { $postgresSingle = Invoke-AzRestJsonSafe -Url $postgresSingleUrl } catch { $postgresErrors += $_.Exception.Message }
+
+            if ($null -eq $postgresFlexible -and $null -eq $postgresSingle) {
+                $errorText = ($postgresErrors -join ' | ')
+                $detail = Get-ShortErrorText -Text $errorText
+                $status = Get-QuotaCollectionStatusFromError -ErrorText $errorText
+                New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'Azure PostgreSQL' -CollectionStatus $status -CollectionDetail $detail
+            }
+            else {
+                $postgresItems = @()
+                if ($postgresFlexible) { $postgresItems += @($postgresFlexible.value) }
+                if ($postgresSingle) { $postgresItems += @($postgresSingle.value) }
+                $partialStatus = if ($postgresErrors.Count -gt 0) { 'CollectedWithPartialSourceFailure' } else { 'Collected' }
+                $partialDetail = if ($postgresErrors.Count -gt 0) { Get-ShortErrorText -Text (($postgresErrors -join ' | ')) } else { $null }
+
+                if ($postgresItems.Count -eq 0) {
+                    New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'Azure PostgreSQL' -QuotaName 'Servers inventory (service quota API unavailable)' -Used 0 -Limit 0 -Unit 'Count' -IsQuotaApplicable $false -NotApplicableReason 'InventoryOnly' -CollectionStatus $partialStatus -CollectionDetail $partialDetail
+                }
+                else {
+                    foreach ($group in ($postgresItems | Group-Object { ([string]$_.location).ToLowerInvariant().Replace(' ', '') })) {
+                        New-QuotaRow -SubscriptionId $subId -SubscriptionName $subName -Region $group.Name -Provider 'Azure PostgreSQL' -QuotaName 'Servers inventory (service quota API unavailable)' -Used ([double]$group.Count) -Limit 0 -Unit 'Count' -IsQuotaApplicable $false -NotApplicableReason 'InventoryOnly' -CollectionStatus $partialStatus -CollectionDetail $partialDetail
+                    }
+                }
+            }
+        }
+        else {
+            New-QuotaStatusRow -SubscriptionId $subId -SubscriptionName $subName -Region 'global' -Provider 'Azure PostgreSQL' -CollectionStatus 'SkippedNotRegistered' -CollectionDetail 'Provider namespace Microsoft.DBforPostgreSQL is not registered for this subscription.'
         }
     }
 }
@@ -1258,7 +1474,7 @@ if ($notRegistered.Count -gt 0) {
 Write-Stage -Number 4 -Name 'Quotas' -Status "Collecting quota data ($($subsRegions.Count) targets)..."
 $quotas = @(
     Get-AzPipelineQuotas -SubsRegions $subsRegions -ThrottleLimit $throttle -Sequential:$Sequential -ProviderRegistrations $providerRegistrations
-    Get-AzPipelineServiceSpecificLimits -SubsRegions $subsRegions
+    Get-AzPipelineServiceSpecificLimits -SubsRegions $subsRegions -ProviderRegistrations $providerRegistrations
 ) | ForEach-Object { Normalize-QuotaRow -Row $_ }
 $quotas | Sort-Object SubscriptionName, Region, Provider, QuotaName | Export-Csv -Path $quotaCsvPath -NoTypeInformation -Encoding UTF8
 
