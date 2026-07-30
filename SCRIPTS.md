@@ -65,6 +65,27 @@ Quick reference for when to run each script, what you need, and what it provides
 
 ---
 
+## 🔐 Identity Hygiene
+
+### When: Cleaning up risky identity/role-assignment exposure on subscriptions
+
+#### **Document-AzureResourceRoles.ps1**
+
+**Use when:** You need a resource inventory showing every identity with an applicable Azure RBAC assignment  
+**What you need:** Azure CLI, Reader access to the selected subscriptions, and directory read access for principal name resolution  
+**What it provides:** CSV resource inventory with Owners plus a `Users` column formatted as `Role:UserName` for assignments granted directly on each resource; inherited assignments are excluded  
+**Command:** `pwsh identity/Document-AzureResourceRoles.ps1 -All -OutputPath ./reports/azure-resource-roles.csv`
+
+#### **Remove-AzBlockedUserRoleAssignment.ps1**
+
+**Use when:** You need to find or remove role assignments held by user accounts that are blocked from signing in (Entra ID `accountEnabled = false`)  
+**What you need:** Azure CLI, subscription name, Reader + User Access Administrator/Owner, directory read (`az ad user show`) in the subscription's tenant  
+**What it provides:** A report of role assignments held by blocked users (grouped by principal with role + resource), and (without `--dry-run`) their removal  
+**Cross-tenant:** Add `-Tenant <id> [-UseDeviceCode]` to scan a subscription in another tenant via an isolated login that leaves your default `az login` unchanged  
+**Command:** `pwsh Remove-AzBlockedUserRoleAssignment.ps1 -SubscriptionName '<name>' --dry-run`
+
+---
+
 ## 📋 Output Files
 
 All reports, CSVs, and data files are organized in `/reports`:
@@ -74,6 +95,17 @@ All reports, CSVs, and data files are organized in `/reports`:
 - `capacity-report-*/` — Generated capacity reports (JSON + summary)
 - `nva*.csv` — NVA data and enriched NVA SKU data
 - `resource-quota-usage*.csv` — Quota exports
+
+---
+
+## 🧩 Reusable Skills
+
+### azure-cli-auth-skill
+
+**Use when:** Creating or updating **any** PowerShell script that uses the Azure CLI (`az`)  
+**What it provides:** The isolated `AZURE_CONFIG_DIR` pattern to authenticate `az` to a specific Entra tenant (`-Tenant` / `-UseDeviceCode`) without changing the operator's default `az login`  
+**Location:** [`.copilot/skills/azure-cli-auth-skill/SKILL.md`](.copilot/skills/azure-cli-auth-skill/SKILL.md)  
+**Reminder:** This is required per [`.github/copilot-instructions.md`](.github/copilot-instructions.md)
 
 ---
 
