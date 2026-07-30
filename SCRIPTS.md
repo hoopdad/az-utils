@@ -74,7 +74,8 @@ Quick reference for when to run each script, what you need, and what it provides
 **Use when:** You need a resource inventory showing every identity with an applicable Azure RBAC assignment  
 **What you need:** Azure CLI, Reader access to the selected subscriptions, and directory read access for principal name resolution  
 **What it provides:** CSV resource inventory with Owners plus a `Users` column formatted as `Role:UserName` for assignments granted directly on each resource; inherited assignments are excluded  
-**Command:** `pwsh identity/Document-AzureResourceRoles.ps1 -All -OutputPath ./reports/azure-resource-roles.csv`
+**Cross-tenant:** Add `-Tenant <id> [-UseDeviceCode]` to use an isolated tenant login that leaves the default Azure CLI profile unchanged  
+**Command:** `pwsh identity/Document-AzureResourceRoles.ps1 -All -Tenant <tenant-id> -OutputPath ./reports/azure-resource-roles.csv`
 
 #### **Remove-AzBlockedUserRoleAssignment.ps1**
 
