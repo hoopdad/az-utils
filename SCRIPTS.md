@@ -65,6 +65,18 @@ Quick reference for when to run each script, what you need, and what it provides
 
 ---
 
+## 🌍 Public Resource Inventory
+
+### **Get-PublicResources.ps1**
+
+**Use when:** You need to identify resources directly associated with public IP addresses across one or all subscriptions in a tenant
+**What you need:** Azure CLI and Reader access to the selected subscriptions
+**What it provides:** CSV with subscription, resource group, resource type/name, public IP details, NIC name, and IP configuration name; NIC-backed IPs resolve to their attached VM when available
+**Cross-tenant:** Add `-Tenant <id-or-domain> [-UseDeviceCode]` to use an isolated tenant login that leaves the default Azure CLI profile unchanged
+**Command:** `pwsh inventory/Get-PublicResources.ps1 -All -Tenant <tenant-id> -OutputPath ./reports/public-resources.csv`
+
+---
+
 ## 🔐 Identity Hygiene
 
 ### When: Cleaning up risky identity/role-assignment exposure on subscriptions
